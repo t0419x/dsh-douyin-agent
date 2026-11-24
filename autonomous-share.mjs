@@ -9,6 +9,23 @@ const day = now => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai',
 const read = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) { if (error.code === 'ENOENT') return fallback; throw fail('自主分享记录无法读取，未重置许可、预算或未确认收据。'); } };
 const write = (file, value) => { const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`; try { fs.writeFileSync(temporary, JSON.stringify(value, null, 2) + '\n', { mode: 0o600, flag: 'wx' }); fs.renameSync(temporary, file); } finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); } };
 const recipientPattern = /^conv:[a-f0-9]{64}$/;
+// 群聊收件人：allowlist 里 isGroup === true 的条目。个人仍要求 followed === true；
+// 群没有关注关系，followed 只要求不是明确的 false（浏览器回读里群的 followed 是 null）。
+// 身份稳定性（见 chat-browser.mjs conversationIdentity）：native 原生 id 稳定；
+// 昵称+头像是后备身份，须在条目里记下核对时的头像（identityAvatar）才算可复核，
+// 且每次分享仍由转发器当场按 id+昵称+头像复核，变了就拒掉那一次分享。
+// 老条目没有 identitySource 时按后备身份对待：能进名单，但每次分享都要当场复核。
+const groupIdentityOk = item => {
+  if (item.identitySource === undefined) return { source: 'unattested', stable: false };
+  if (item.identitySource === 'native') return { source: 'native', stable: true };
+  if (item.identitySource === 'display-name-avatar' && typeof item.identityAvatar === 'string' && item.identityAvatar) return { source: 'display-name-avatar', stable: false };
+  return null;
+};
+const recipientOk = item => {
+  if (!item || !recipientPattern.test(item.id) || typeof item.verifiedAt !== 'string' || !Number.isFinite(Date.parse(item.verifiedAt)) || typeof item.name !== 'string' || !item.name.trim()) return false;
+  if (item.isGroup === true) return item.followed !== false && groupIdentityOk(item) !== null;
+  return item.followed === true && item.isGroup === false;
+};
 const evidencePattern = /^video:[a-f0-9]{64}$/;
 const statuses = new Set(['reserved', 'clicking', 'confirmed', 'not-sent', 'uncertain', 'resolved-confirmed', 'resolved-not-sent']);
 
@@ -33,9 +50,9 @@ export class AutonomousShare {
     try { return action(); } finally { release(); }
   }
   policy() {
-    const value = read(this.files.policy, { version: 1, enabled: false, dailyLimit: 3 });
-    if (!value || value.version !== 1 || typeof value.enabled !== 'boolean' || !Number.isSafeInteger(value.dailyLimit) || value.dailyLimit < 1 || value.dailyLimit > 20) throw fail('自主分享许可损坏，未启用发送。');
-    return value;
+    const value = read(this.files.policy, { version: 1, enabled: false, dailyLimit: 3, allowGroups: true });
+    if (!value || value.version !== 1 || typeof value.enabled !== 'boolean' || !Number.isSafeInteger(value.dailyLimit) || value.dailyLimit < 1 || value.dailyLimit > 20 || (value.allowGroups !== undefined && typeof value.allowGroups !== 'boolean')) throw fail('自主分享许可损坏，未启用发送。');
+    return { ...value, allowGroups: value.allowGroups ?? true };
   }
   ledger() {
     const value = read(this.files.ledger, { version: 1, days: {}, operations: [] });
@@ -46,9 +63,13 @@ export class AutonomousShare {
     return value;
   }
   recipients() {
+    const sharePolicy = this.policy();
     const policy = read(path.join(this.stateDir, 'chat-policy.json'), { allowlist: [] });
-    if (!Array.isArray(policy?.allowlist) || policy.allowlist.length > 10 || new Set(policy.allowlist.map(item => item?.id)).size !== policy.allowlist.length || policy.allowlist.some(item => !item || !recipientPattern.test(item.id) || item.followed !== true || item.isGroup !== false || typeof item.verifiedAt !== 'string' || !Number.isFinite(Date.parse(item.verifiedAt)) || typeof item.name !== 'string' || !item.name.trim())) throw fail('现有好友白名单未通过核对，未允许自主分享。');
-    return policy.allowlist.map(({ id, name }) => ({ id, name }));
+    if (!Array.isArray(policy?.allowlist) || policy.allowlist.length > 10 || new Set(policy.allowlist.map(item => item?.id)).size !== policy.allowlist.length || policy.allowlist.some(item => !recipientOk(item)) || policy.allowlist.some(item => item?.isGroup === true && sharePolicy.allowGroups !== true)) throw fail('现有好友白名单未通过核对，未允许自主分享。');
+    return policy.allowlist.map(item => {
+      const identity = item.isGroup === true ? groupIdentityOk(item) : { source: item.identitySource ?? 'unattested', stable: item.identitySource ? item.identitySource === 'native' : true };
+      return { id: item.id, name: item.name, isGroup: item.isGroup === true, identitySource: identity.source, stableIdentity: identity.stable };
+    });
   }
   unresolved(ledger = this.ledger(), except) {
     return ledger.operations.filter(item => item.operationId !== except && ['uncertain', 'reserved', 'clicking'].includes(item.status));
@@ -58,7 +79,7 @@ export class AutonomousShare {
     const unresolved = this.unresolved(ledger), guard = read(this.files.send, null);
     if (guard && (!Number.isSafeInteger(guard.pid) || typeof guard.token !== 'string')) throw fail('自主分享发送锁损坏，请先核对收据。');
     const recoveryRequired = Boolean(guard && !alive(guard.pid));
-    return { protocol: 'autonomous-share-v1', enabled: policy.enabled, dailyLimit: policy.dailyLimit, timeZone: 'Asia/Shanghai', daily: { date, attempts: ledger.days[date] || 0, remaining: Math.max(0, policy.dailyLimit - (ledger.days[date] || 0)) }, recipients, paused: unresolved.length > 0 || recoveryRequired, busy: Boolean(guard && alive(guard.pid)), needsReview: unresolved.map(({ operationId, videoId, recipientId, status, forwardOperationId, startedAt }) => ({ operationId, videoId, recipientId, status, forwardOperationId, startedAt })), recoveryRequired, receiptsFile: this.files.ledger, recent: ledger.operations.slice(-10).map(({ operationId, videoId, recipientId, status, forwardOperationId, messageId, startedAt, completedAt }) => ({ operationId, videoId, recipientId, status, forwardOperationId, messageId, startedAt, completedAt })) };
+    return { protocol: 'autonomous-share-v1', enabled: policy.enabled, dailyLimit: policy.dailyLimit, allowGroups: policy.allowGroups, timeZone: 'Asia/Shanghai', daily: { date, attempts: ledger.days[date] || 0, remaining: Math.max(0, policy.dailyLimit - (ledger.days[date] || 0)) }, recipients, paused: unresolved.length > 0 || recoveryRequired, busy: Boolean(guard && alive(guard.pid)), needsReview: unresolved.map(({ operationId, videoId, recipientId, status, forwardOperationId, startedAt }) => ({ operationId, videoId, recipientId, status, forwardOperationId, startedAt })), recoveryRequired, receiptsFile: this.files.ledger, recent: ledger.operations.slice(-10).map(({ operationId, videoId, recipientId, status, forwardOperationId, messageId, startedAt, completedAt }) => ({ operationId, videoId, recipientId, status, forwardOperationId, messageId, startedAt, completedAt })) };
   }
   context() {
     const state = this.state();
@@ -66,11 +87,11 @@ export class AutonomousShare {
   }
   configure(input = {}, { explicit = false } = {}) {
     if (!explicit) throw fail('自主分享许可只能由用户在本机设置。', 403);
-    if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !['enabled', 'dailyLimit'].includes(key)) || typeof input.enabled !== 'boolean' || input.dailyLimit !== undefined && (!Number.isSafeInteger(input.dailyLimit) || input.dailyLimit < 1 || input.dailyLimit > 20)) throw fail('自主分享只接受开关和 1 至 20 的每日上限。', 400);
+    if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !['enabled', 'dailyLimit', 'allowGroups'].includes(key)) || typeof input.enabled !== 'boolean' || input.dailyLimit !== undefined && (!Number.isSafeInteger(input.dailyLimit) || input.dailyLimit < 1 || input.dailyLimit > 20) || input.allowGroups !== undefined && typeof input.allowGroups !== 'boolean') throw fail('自主分享只接受开关和 1 至 20 的每日上限。', 400);
     this.control(() => {
       const policy = this.policy();
       if (input.enabled) { if (!this.recipients().length) throw fail('请先保存已验证好友，再开启自主分享。'); if (this.unresolved().length || this.state().recoveryRequired) throw fail('上次分享结果需要核对；重新开关不会清除未确认记录。'); }
-      write(this.files.policy, { ...policy, enabled: input.enabled, dailyLimit: input.dailyLimit ?? policy.dailyLimit });
+      write(this.files.policy, { ...policy, enabled: input.enabled, dailyLimit: input.dailyLimit ?? policy.dailyLimit, allowGroups: input.allowGroups ?? policy.allowGroups });
     });
     if (!input.enabled) this.active?.abort.abort(fail('用户关闭了自主分享。'));
     return this.state();

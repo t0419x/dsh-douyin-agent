@@ -93,7 +93,10 @@ export class VideoForwarder {
     let policy; try { policy = JSON.parse(fs.readFileSync(this.policyFile, 'utf8')); } catch { throw new Error('本机联系人白名单不可读，未转发。'); }
     if (!Array.isArray(policy.allowlist) || policy.allowlist.length > 10) throw new Error('本机固定联系人名单不符合当前授权范围。');
     const matched = policy.allowlist.filter(item => item.id === recipientId);
-    if (matched.length !== 1 || matched[0].followed !== true || matched[0].isGroup !== false || !matched[0].verifiedAt) throw new Error('收件人不在已核对的两位好友名单内，未转发。');
+    const m = matched[0];
+    const personalOk = m.isGroup === false && m.followed === true;
+    const groupOk = m.isGroup === true && m.followed !== false && (m.identitySource === 'native' || (m.identitySource === 'display-name-avatar' && typeof m.identityAvatar === 'string' && m.identityAvatar) || m.identitySource === undefined);
+    if (matched.length !== 1 || !(personalOk || groupOk) || !m.verifiedAt) throw new Error('收件人不在已核对的两位好友名单内，未转发。');
     return matched[0];
   }
   async gate(signal) {
@@ -117,7 +120,12 @@ export class VideoForwarder {
     const list = await this.chatBrowser.listContacts({ signal, verifyFollowing: true });
     if (list.blocked || list.loginRequired || list.verificationRequired) throw new Error('联系人关系核对需要登录或验证，未转发。');
     const contacts = list.contacts.filter(item => item.id === recipientId);
-    if (contacts.length !== 1 || contacts[0].followed !== true || contacts[0].isGroup !== false || contacts[0].name !== stored.name) throw new Error('收件人的当前身份或关注关系与固定名单不一致，未转发。');
+    if (contacts.length !== 1) throw new Error('收件人的当前身份或关注关系与固定名单不一致，未转发。');
+    const c = contacts[0];
+    const personalOk2 = c.isGroup === false && c.followed === true && c.name === stored.name;
+    const groupAvatarOk = stored.identitySource !== 'display-name-avatar' || (typeof stored.identityAvatar === 'string' && stored.identityAvatar && c.avatar === stored.identityAvatar);
+    const groupOk2 = c.isGroup === true && c.followed !== false && c.name === stored.name && groupAvatarOk;
+    if (!(personalOk2 || groupOk2)) throw new Error('收件人的当前身份或关注关系与固定名单不一致，未转发。');
     const contact = this.chatBrowser.contacts.get(recipientId);
     if (!contact?.avatar || contact.displayName !== contacts[0].name) throw new Error('收件人的会话头像或昵称不可核对，未转发。');
     return contact;
