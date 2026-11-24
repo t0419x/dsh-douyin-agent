@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { resolveRuntimePaths } from './runtime-paths.mjs';
 import { randomUUID } from 'node:crypto';
 
@@ -7,6 +8,36 @@ const DAY = 86_400_000;
 const SOURCES = ['api', 'dsh'];
 const READ_ACTIONS = new Set(['douyin_status', 'douyin_pause', 'douyin_recall', 'douyin_remember', 'douyin_video_limits_status']);
 export const DEFAULT_VIDEO_POLICY = Object.freeze({ version: 1, timeZone: 'Asia/Shanghai', windows: ['00:00-24:00'], sessionMinutes: 10 });
+// 定时启动默认关闭：只有用户在控制台明确打开后，定时器才会在允许时段开始新一轮。
+// checkIntervalMs：每隔多久看一次是否进了允许时段；maxRetries：一次 tick 内开轮失败重试几次；
+// retryBaseMs：重试退避基准（第 n 次重试前等 retryBaseMs * 2^n）。
+export const DEFAULT_SCHEDULE = Object.freeze({ version: 1, enabled: false, checkIntervalMs: 30_000, maxRetries: 3, retryBaseMs: 5_000 });
+// 每个时段最多用几个 tick 尝试开轮；超过就记一次“错过”，等下一个时段再试，不再追着重试。
+export const SCHEDULE_MAX_TICKS_PER_WINDOW = 3;
+export function scheduleBackoffMs(attempt, baseMs) {
+  if (!Number.isSafeInteger(attempt) || attempt < 0 || !Number.isSafeInteger(baseMs) || baseMs < 0) throw new Error('定时启动退避无效。');
+  return Math.min(baseMs * 2 ** attempt, 60_000);
+}
+function defaultScheduleState() { return { version: 1, started: {}, seen: {}, attempts: {}, missed: [] }; }
+export function validateSchedule(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('定时启动设置必须是对象。');
+  for (const key of Object.keys(input)) if (!['version', 'enabled', 'checkIntervalMs', 'maxRetries', 'retryBaseMs'].includes(key)) throw new Error(`不支持的定时启动设置：${key}`);
+  if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw new Error('定时启动开关须是布尔值。');
+  if (input.checkIntervalMs !== undefined && (!Number.isSafeInteger(input.checkIntervalMs) || input.checkIntervalMs < 5_000 || input.checkIntervalMs > 600_000)) throw new Error('定时启动检查间隔须是 5 至 600 秒的整数毫秒。');
+  if (input.maxRetries !== undefined && (!Number.isSafeInteger(input.maxRetries) || input.maxRetries < 0 || input.maxRetries > 5)) throw new Error('定时启动重试次数须是 0 至 5 的整数。');
+  if (input.retryBaseMs !== undefined && (!Number.isSafeInteger(input.retryBaseMs) || input.retryBaseMs < 1_000 || input.retryBaseMs > 60_000)) throw new Error('定时启动退避基准须是 1 至 60 秒的整数毫秒。');
+  return { version: 1, enabled: input.enabled ?? DEFAULT_SCHEDULE.enabled, checkIntervalMs: input.checkIntervalMs ?? DEFAULT_SCHEDULE.checkIntervalMs, maxRetries: input.maxRetries ?? DEFAULT_SCHEDULE.maxRetries, retryBaseMs: input.retryBaseMs ?? DEFAULT_SCHEDULE.retryBaseMs };
+}
+export function validateScheduleState(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input) || input.version !== 1) throw new Error('定时启动记录损坏，未重置开轮与错过记录。');
+  const badId = value => typeof value !== 'string' || !value;
+  for (const field of ['started', 'seen']) {
+    if (!input[field] || typeof input[field] !== 'object' || Array.isArray(input[field]) || Object.values(input[field]).some(badId)) throw new Error('定时启动记录损坏，未重置开轮与错过记录。');
+  }
+  if (!input.attempts || typeof input.attempts !== 'object' || Array.isArray(input.attempts) || Object.values(input.attempts).some(item => !item || !Number.isSafeInteger(item.ticks) || item.ticks < 0 || !Number.isSafeInteger(item.tries) || item.tries < 0 || typeof item.lastError !== 'string' || item.lastError.length > 500 || typeof item.at !== 'string')) throw new Error('定时启动记录损坏，未重置开轮与错过记录。');
+  if (!Array.isArray(input.missed) || input.missed.length > 16 || input.missed.some(item => !item || !Number.isSafeInteger(item.windowStart) || !Number.isSafeInteger(item.windowEnd) || typeof item.reason !== 'string' || item.reason.length > 500 || typeof item.at !== 'string')) throw new Error('定时启动记录损坏，未重置开轮与错过记录。');
+  return { version: 1, started: { ...input.started }, seen: { ...input.seen }, attempts: { ...input.attempts }, missed: [...input.missed] };
+}
 const shanghai = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
 const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
 function write(file, value) { const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`; fs.writeFileSync(temporary, JSON.stringify(value, null, 2), { mode: 0o600 }); fs.renameSync(temporary, file); }
@@ -47,7 +78,9 @@ export class VideoLimits {
   constructor({ stateDir = resolveRuntimePaths().stateDir, now = Date.now } = {}) {
     Object.assign(this, { stateDir, now }); fs.mkdirSync(stateDir, { recursive: true });
     this.policyFile = path.join(stateDir, 'video-policy.json'); this.sessionsFile = path.join(stateDir, 'video-sessions.json'); this.guardFile = path.join(stateDir, 'video-control.guard');
+    this.scheduleFile = path.join(stateDir, 'video-schedule.json'); this.scheduleStateFile = path.join(stateDir, 'video-schedule-state.json');
     initialize(this.policyFile, DEFAULT_VIDEO_POLICY); initialize(this.sessionsFile, { version: 1, current: null });
+    initialize(this.scheduleFile, DEFAULT_SCHEDULE); initialize(this.scheduleStateFile, defaultScheduleState());
     this.enforcing = false;
   }
   control(action) {
@@ -68,6 +101,100 @@ export class VideoLimits {
     else if (session.status !== 'active') reason = session.reason || '当前这轮已经结束，请显式开始新一轮。';
     else if (now < session.startAt || now >= expiresAt) reason = '本轮刷视频时间已用完，请显式开始新一轮。';
     return { protocol: 'video-limits-v1', timeZone: 'Asia/Shanghai', now, policy, session: session ? { ...session, expiresAt } : null, window, allowed: !reason, reason, remainingSeconds: !reason ? Math.max(0, Math.ceil((expiresAt - now) / 1000)) : 0 };
+  }
+  schedule() { return validateSchedule(read(this.scheduleFile)); }
+  scheduleState() { return validateScheduleState(read(this.scheduleStateFile)); }
+  configureSchedule(input, { explicit = false } = {}) {
+    if (!explicit) throw new Error('定时启动只能由用户在控制台明确打开或修改。');
+    const config = validateSchedule(input);
+    return this.control(() => { write(this.scheduleFile, config); return this.schedule(); });
+  }
+  // 定时启动：每隔 checkIntervalMs 看一次允许时段。默认关闭；只应创建一个调度器
+  //（由 AutonomousWatch.startAutoSchedule 创建，见 autonomous-watch.mjs），
+  // 两个调度器会抢着开轮——开轮本身有锁不会开出两轮，但失败记录会翻倍。
+  // 语义：每个允许时段最多自动开一轮；开轮失败时当次 tick 内按退避重试，
+  // 下个 tick 还能接着追，直到用完 SCHEDULE_MAX_TICKS_PER_WINDOW 个 tick，
+  // 再失败就记一条 missed，等下一个时段；时段结束时只收尾本调度器开的那轮，
+  // 手动开的轮次不由它结束。用户已配好的时段（video-policy.json）原样不动。
+  createAutoScheduler({ onSlotStart, onSlotEnd, onEvent = () => {}, delayImpl = (ms) => delay(ms) } = {}) {
+    if (onSlotStart !== undefined && typeof onSlotStart !== 'function') throw new Error('定时启动缺少时段开始回调。');
+    if (onSlotEnd !== undefined && typeof onSlotEnd !== 'function') throw new Error('定时启动缺少时段结束回调。');
+    if (typeof onEvent !== 'function' || typeof delayImpl !== 'function') throw new Error('定时启动缺少事件或延时接口。');
+    const stopped = { current: false, ticking: false };
+    const windowKey = (window) => String(window.startAt);
+    const prune = (runtime, now) => {
+      for (const field of ['started', 'seen', 'attempts']) for (const key of Object.keys(runtime[field])) if (Number(key) < now - 48 * 3600_000) delete runtime[field][key];
+      runtime.missed = runtime.missed.filter(item => now - Date.parse(item.at) < 7 * DAY).slice(-16);
+    };
+    const tick = async () => {
+      if (stopped.current || stopped.ticking) return { skipped: true };
+      stopped.ticking = true;
+      try {
+        const config = this.schedule();
+        if (!config.enabled) return { enabled: false };
+        let current;
+        try { current = this.state(); } catch (error) { onEvent({ type: 'schedule.state_error', message: `定时启动读取视频时间状态失败：${error.message}` }); return { error: error.message }; }
+        const runtime = this.scheduleState();
+        const now = this.now();
+        prune(runtime, now);
+        const active = current.allowed && current.session?.status === 'active';
+        if (current.window && active) {
+          // 轮次进行中（手动开的也算）：记下本时段已有过一轮，不再重复启动。
+          const key = windowKey(current.window);
+          if (!runtime.seen[key]) { runtime.seen[key] = current.session.id; write(this.scheduleStateFile, runtime); }
+          return { enabled: true, inWindow: true, active: true };
+        }
+        if (current.window && !active) {
+          const key = windowKey(current.window);
+          if (runtime.started[key] || runtime.seen[key]) return { enabled: true, inWindow: true, startedAlready: true };
+          const attempt = runtime.attempts[key] || { ticks: 0, tries: 0, lastError: '', at: '' };
+          if (attempt.ticks >= SCHEDULE_MAX_TICKS_PER_WINDOW) {
+            if (!runtime.missed.some(item => item.windowStart === current.window.startAt)) {
+              runtime.missed.push({ windowStart: current.window.startAt, windowEnd: current.window.expiresAt, reason: attempt.lastError || '定时启动多次重试均失败。', at: new Date(now).toISOString() });
+              runtime.missed = runtime.missed.slice(-16);
+              write(this.scheduleStateFile, runtime);
+              onEvent({ type: 'schedule.slot_missed', message: `本时段定时启动失败 ${attempt.tries} 次，已记录为错过，下个时段再试：${attempt.lastError}`.slice(0, 300) });
+            }
+            return { enabled: true, inWindow: true, missed: true };
+          }
+          attempt.ticks += 1; attempt.at = new Date(now).toISOString();
+          let started = null;
+          for (let n = 0; n < Math.max(1, config.maxRetries); n++) {
+            try {
+              const state = this.markSession('dsh', { explicit: true });
+              started = state.session; break;
+            } catch (error) {
+              attempt.tries += 1; attempt.lastError = String(error?.message || error).slice(0, 200); attempt.at = new Date(this.now()).toISOString();
+              runtime.attempts[key] = attempt; write(this.scheduleStateFile, runtime);
+              onEvent({ type: 'schedule.start_failed', message: `定时启动第 ${attempt.tries} 次失败：${attempt.lastError}`.slice(0, 300) });
+              if (n + 1 < config.maxRetries) await delayImpl(scheduleBackoffMs(n, config.retryBaseMs));
+            }
+          }
+          if (started) {
+            runtime.started[key] = started.id; delete runtime.attempts[key]; write(this.scheduleStateFile, runtime);
+            onEvent({ type: 'schedule.slot_started', message: `定时启动成功，已开始新一轮（时段至 ${new Date(current.window.expiresAt).toISOString()}）。` });
+            try { await onSlotStart?.({ sessionId: started.id, window: current.window }); } catch (error) { onEvent({ type: 'schedule.watch_start_failed', message: `定时启动后开始自主观看失败：${String(error?.message || error).slice(0, 200)}` }); }
+            return { enabled: true, inWindow: true, started: started.id };
+          }
+          runtime.attempts[key] = attempt; write(this.scheduleStateFile, runtime);
+          return { enabled: true, inWindow: true, failed: true, tries: attempt.tries };
+        }
+        // 不在允许时段：只收尾本调度器开的那轮；手动开的轮次不由它结束。
+        for (const [key, sessionId] of Object.entries(runtime.started)) {
+          if (current.session?.id === sessionId && current.session?.status === 'active') {
+            try { this.endSession({ explicit: true, reason: '允许时段结束，自动结束本轮。' }); } catch {}
+            onEvent({ type: 'schedule.slot_ended', message: '允许时段结束，已自动结束本轮。' });
+            try { await onSlotEnd?.({ sessionId }); } catch (error) { onEvent({ type: 'schedule.watch_stop_failed', message: `时段结束时停止自主观看失败：${String(error?.message || error).slice(0, 200)}` }); }
+          }
+          delete runtime.started[key];
+        }
+        write(this.scheduleStateFile, runtime);
+        return { enabled: true, inWindow: false };
+      } finally { stopped.ticking = false; }
+    };
+    const config = this.schedule();
+    const timer = setInterval(() => { void tick().catch((error) => onEvent({ type: 'schedule.tick_error', message: String(error?.message || error).slice(0, 200) })); }, config.checkIntervalMs); timer.unref?.();
+    return { stop: () => { stopped.current = true; clearInterval(timer); }, tick, config: () => this.schedule(), state: () => this.scheduleState() };
   }
   savePolicy(input, { explicit = false } = {}) {
     if (!explicit) throw new Error('视频时间设置只能由用户在控制台明确修改。');
