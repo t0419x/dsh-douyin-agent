@@ -192,14 +192,15 @@ export async function apply(ctx, config = {}) {
       if(starting) sharedPersona.initialize({importLegacy:false});
       const route=exec.agent?.session?.requestHeader?.()?.config ?? exec.agent?.options ?? {};
       const relay=readRelayConfig();
-      return new AutonomousWatch({controller,videoLimits:controller.limits(),personaMemory:sharedPersona,commentService:await controller.getComments(),reportService:await controller.getReport(),source:'dsh',config:relay?{apiKey:relay.apiKey,baseUrl:relay.baseUrl,model:relay.model}:{apiKey:'',baseUrl:'https://api.deepseek.com',model:route.model||'deepseek-flash'},...(starting&&!relay?{decisionProvider:createNativeWatchDecision({llm:optionalService(ctx,'llm'),attachments:optionalService(ctx,'attachments'),agent:exec.agent})}:{})});
+      return new AutonomousWatch({controller,videoLimits:controller.limits(),personaMemory:sharedPersona,commentService:await controller.getComments(),reportService:await controller.getReport(),source:'dsh',config:relay?{apiKey:relay.apiKey,baseUrl:relay.baseUrl,model:relay.model}:{apiKey:'',baseUrl:'https://api.deepseek.com',model:route.model||'deepseek-flash'},...(starting&&!relay?{decisionProvider:createNativeWatchDecision({llm:optionalService(ctx,'llm'),attachments:optionalService(ctx,'attachments'),agent:exec.agent,purpose:'watch'})}:{})});
     }).catch(error=>{watchPromise=undefined;throw error;});
     const watch=await watchPromise;
     if(starting) {
       if(watch.state().worker?.alive) throw new Error('已有自主观看在运行，请先停止。');
-      if(!readRelayConfig()) watch.decisionProvider=createNativeWatchDecision({llm:optionalService(ctx,'llm'),attachments:optionalService(ctx,'attachments'),agent:exec.agent});
+      if(!readRelayConfig()) watch.decisionProvider=createNativeWatchDecision({llm:optionalService(ctx,'llm'),attachments:optionalService(ctx,'attachments'),agent:exec.agent,purpose:'watch'});
       sharedPersona.initialize({importLegacy:false});
     }
+    try { watch.startAutoSchedule(); } catch {}
     return watch;
   };
   const getSpark = async (exec, starting) => {
