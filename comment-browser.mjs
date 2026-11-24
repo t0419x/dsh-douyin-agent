@@ -67,6 +67,25 @@ export function findPostedComment({ text, beforeIds }) {
   return null;
 }
 
+// 点赞按钮只认页面上唯一的可见候选；找不到或不唯一就不点。
+// 已点亮（aria-pressed 或 liked/active 标记）时不重复点；点后读不到状态变化就报不确定，绝不补点。
+export async function clickLikeButton() {
+  const visible = element => { const r = element.getBoundingClientRect(), s = getComputedStyle(element); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth && s.display !== 'none' && s.visibility !== 'hidden'; };
+  const pressed = element => element.getAttribute('aria-pressed') === 'true' || /(?:^|\s)(liked|active)(?:\s|$)/i.test(element.className || '') || /liked/i.test(element.getAttribute('data-e2e') || '');
+  const countText = element => (element.closest('[class*="action" i],[class*="Action" i]')?.innerText || element.parentElement?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+  const candidates = [...document.querySelectorAll('[data-e2e="like-btn"],[data-e2e="like-icon"],button[aria-label*="点赞"],[aria-label*="点赞"],[title*="点赞"]')].filter(element => !element.closest('[data-e2e="im-dialog"]') && visible(element));
+  if (!candidates.length) return { found: false, clicked: false };
+  if (candidates.length > 1) return { found: true, clicked: false, ambiguous: true, count: candidates.length };
+  const element = candidates[0];
+  if (pressed(element)) return { found: true, clicked: false, alreadyLiked: true };
+  const before = countText(element);
+  element.click();
+  await new Promise(resolve => setTimeout(resolve, 700));
+  const after = countText(element);
+  const liked = pressed(element) || (before !== after && after !== '');
+  return { found: true, clicked: true, liked, uncertain: !liked };
+}
+
 function assertVideo(state, expectedVideoId) {
   if (state?.loginRequired || state?.verificationRequired || state?.unsupportedPage || state?.privateChatVisible || state?.blocked || state?.video?.id !== expectedVideoId || state.video.readyState < 2) throw new Error('当前作品、登录状态或页面遮挡无法核对，未发布评论。');
   const url = state.video.url || state.url;
@@ -353,6 +372,23 @@ export class CommentBrowser {
       if (receiptWritten) this.record({ ...operation, status: 'uncertain', completedAt: new Date().toISOString() });
       return { confirmed: false, deliveryUncertain: false, operationId: operation.operationId, videoId: expectedVideoId, reason: error.message || '评论发布前检查未通过，草稿已保留。' };
     } finally { releaseDispatch?.(); try { await cleanupWitness?.(); } catch { /* 清理失败不影响发布收据。 */ } release(); }
+  }
+  // 成长点赞：只点当前作品一次；找不到唯一按钮、已点亮、或点后状态无法确认时都不补点。
+  // 调用方（自主观看的成长逻辑）先核对兴趣主题与每日上限；这里只负责“在当前页点一次”的安全动作。
+  async like({ expectedVideoId } = {}, { signal } = {}) {
+    if (typeof expectedVideoId !== 'string' || !/^\d{1,64}$/.test(expectedVideoId)) throw new TypeError('点赞只能指定当前作品编号。');
+    stop(signal); await this.gate(signal);
+    return await this.controller.withPage(async page => {
+      stop(signal); await this.gate(signal);
+      assertVideo(await page.evaluate(readPageState), expectedVideoId);
+      const result = await page.evaluate(clickLikeButton);
+      if (!result.found) return { liked: false, videoId: expectedVideoId, reason: '没有找到点赞按钮，未点击。' };
+      if (result.ambiguous) return { liked: false, videoId: expectedVideoId, reason: `点赞按钮有 ${result.count} 个候选，未点击。` };
+      if (result.alreadyLiked) return { liked: false, alreadyLiked: true, videoId: expectedVideoId, reason: '这条已经点过赞了。' };
+      if (!result.clicked) return { liked: false, videoId: expectedVideoId, reason: '点赞未能点击。' };
+      if (result.liked) return { liked: true, videoId: expectedVideoId };
+      return { liked: false, deliveryUncertain: true, videoId: expectedVideoId, reason: '点赞已点出，但页面状态未能确认是否已点亮，未重复点击。' };
+    }, { signal });
   }
   async close() { if (this.ownsController) await this.controller.close(); }
 }
