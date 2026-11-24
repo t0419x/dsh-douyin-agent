@@ -17,6 +17,7 @@ import { pickExtraMention, readChatAllowlist, mentionNoneProbability } from './m
 import { dedupeFramesByTime } from './frame-composite.mjs';
 import { CaptureSession } from './capture-session.mjs';
 import { cleanupOldMedia } from './media-cleanup.mjs';
+import { isEdgeGoneError, backoffMs } from './browser-launcher.mjs';
 
 // 单轮不再设请求上限：时长本身就是硬边界，另留每天 400 次做兜底（2026-10-24 主人定，原 200）。
 // 2026-10-27 主人定：视频开头 3 秒叫「采样」，1.5 秒一张（3 张）；同一条作品之后的「观察」
@@ -53,6 +54,24 @@ export const LONG_VIDEO = Object.freeze({ minDuration: 180, ratio: 0.8 });
 // ⚠️ 临时测试档（主人 2026-10-23 17:14 定，测完要恢复）：刷到 <2 分钟的作品就强制看到底，
 // 然后直接发一条评论，不再问“要不要评”。恢复原逻辑只需把 enabled 改成 false。
 export const TEST_SHORT_COMMENTS = Object.freeze({ enabled: false, maxSeconds: 120 });
+// 成长（默认全关）：在兴趣主题作品上点赞/评论，帮账号涨互动——只对模型给了 10 秒以上
+// stay 且 topics 里有 like 信号的作品（与 applyPacing 同一条收紧规则），每天各有上限，
+// 每条作品最多点赞/评论一次。开关与上限存在 growth-policy.json（不碰 native-settings.mjs，
+// UI 接线点见 configureGrowth）；计数存在 growth-ledger.json，重启不重置。
+export const DEFAULT_GROWTH_POLICY = Object.freeze({ version: 1, likeEnabled: false, commentEnabled: false, likeDailyCap: 20, commentDailyCap: 5 });
+export function validateGrowthPolicy(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('成长设置必须是对象。');
+  for (const key of Object.keys(input)) if (!['version', 'likeEnabled', 'commentEnabled', 'likeDailyCap', 'commentDailyCap'].includes(key)) throw new Error(`不支持的成长设置：${key}`);
+  if (input.likeEnabled !== undefined && typeof input.likeEnabled !== 'boolean') throw new Error('成长点赞开关须是布尔值。');
+  if (input.commentEnabled !== undefined && typeof input.commentEnabled !== 'boolean') throw new Error('成长评论开关须是布尔值。');
+  if (input.likeDailyCap !== undefined && (!Number.isSafeInteger(input.likeDailyCap) || input.likeDailyCap < 1 || input.likeDailyCap > 100)) throw new Error('成长点赞每日上限须是 1 至 100 的整数。');
+  if (input.commentDailyCap !== undefined && (!Number.isSafeInteger(input.commentDailyCap) || input.commentDailyCap < 1 || input.commentDailyCap > 20)) throw new Error('成长评论每日上限须是 1 至 20 的整数。');
+  return { version: 1, likeEnabled: input.likeEnabled ?? DEFAULT_GROWTH_POLICY.likeEnabled, commentEnabled: input.commentEnabled ?? DEFAULT_GROWTH_POLICY.commentEnabled, likeDailyCap: input.likeDailyCap ?? DEFAULT_GROWTH_POLICY.likeDailyCap, commentDailyCap: input.commentDailyCap ?? DEFAULT_GROWTH_POLICY.commentDailyCap };
+}
+// 兴趣主题匹配：10 秒以上的 stay + topics 里有 like 信号（与 applyPacing 的 hot 规则一致）。
+export function growthTopicMatch(decision) {
+  return Boolean(decision?.action === 'stay' && Number.isFinite(decision.seconds) && decision.seconds >= 10 && Array.isArray(decision.topics) && decision.topics.some(item => item?.signal === 'like'));
+}
 const alive = pid => { if (!Number.isSafeInteger(pid) || pid < 1) return false; try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
 const read = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) { if (error.code === 'ENOENT') return fallback; throw new Error('自主观看状态文件损坏，未重置预算或运行锁。'); } };
 const write = (file, value) => { const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`; try { fs.writeFileSync(temporary, JSON.stringify(value, null, 2), { mode: 0o600, flag: 'wx' }); fs.renameSync(temporary, file); } finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); } };
@@ -76,6 +95,11 @@ export class AutonomousWatch {
     this.running = false; this.completion = null; this.abort = null; this.runId = null; this.sessionId = null; this.lastRaiseAt = 0; this.track = null;
     this.diaryStats = { written: 0, skipped: 0, failed: 0, privateWritten: 0, rewriteCalls: 0, rewriteTokens: 0, lastAt: '', lastVideoId: '' };
     this.diaryStatsFile = path.join(stateDir, 'watch-diary.json');
+    this.files.growthPolicy = path.join(stateDir, 'growth-policy.json');
+    this.files.growthLedger = path.join(stateDir, 'growth-ledger.json');
+    this._growthCandidates = new Set();
+    this._growthCommenter = null; this._growthCommenterPromise = null;
+    this._autoScheduler = null; this._reconnectCount = 0;
   }
   control(action) {
     let descriptor; const token = randomUUID();
@@ -99,7 +123,7 @@ export class AutonomousWatch {
     const sessionId = worker?.sessionId || time.session?.id || saved.sessionId || null;
     const budget = this.budget(), counts = budget.sessions[sessionId] || { requests: 0 };
     const request = read(this.files.stop, null), stopping = worker?.alive && request?.runId === worker.runId;
-    return redact({ protocol: 'autonomous-watch-v1', running: Boolean(worker?.alive), owned: Boolean(worker?.owned), worker, status: stopping ? 'stopping' : worker?.alive ? 'running' : ['running', 'stopping'].includes(saved.status) ? 'stopped' : saved.status || 'stopped', sessionId, counts: { ...counts, dailyRequests: budget.days[day(this.now())] || 0, dailyLimit: WATCH_LIMITS.dailyLimit }, lastDecision: saved.lastDecision || null, lastUsage: saved.usage || null, diary: read(this.diaryStatsFile, null) || saved.diary || null, lastError: saved.lastError || '', pacing: saved.pacing || null, payload: saved.payload || null, remainingSeconds: time.allowed && time.session?.id === sessionId ? time.remainingSeconds : 0 }, [this.config.apiKey]);
+    return redact({ protocol: 'autonomous-watch-v1', running: Boolean(worker?.alive), owned: Boolean(worker?.owned), worker, status: stopping ? 'stopping' : worker?.alive ? 'running' : ['running', 'stopping'].includes(saved.status) ? 'stopped' : saved.status || 'stopped', sessionId, counts: { ...counts, dailyRequests: budget.days[day(this.now())] || 0, dailyLimit: WATCH_LIMITS.dailyLimit }, lastDecision: saved.lastDecision || null, lastUsage: saved.usage || null, diary: read(this.diaryStatsFile, null) || saved.diary || null, lastError: saved.lastError || '', pacing: saved.pacing || null, payload: saved.payload || null, schedule: this.scheduleStateSafe(), growth: this.growthStateSafe(), reconnects: this._reconnectCount || 0, remainingSeconds: time.allowed && time.session?.id === sessionId ? time.remainingSeconds : 0 }, [this.config.apiKey]);
   }
   /** 一轮结束时弹一条 Windows 通知（借 dsh-douyin-scroll 的 toast，2026-10-24）。永不抛。 */
   notifyRoundEnd(result) {
@@ -167,7 +191,7 @@ export class AutonomousWatch {
       this.runId = randomUUID(); this.sessionId = time.session.id;
       write(this.files.lock, { version: 1, pid: process.pid, runId: this.runId, sessionId: this.sessionId, source: this.source, status: 'running', heartbeatAt: this.now() });
     });
-    this.abort = new AbortController(); this.running = true; this.startedDate = day(this.now()); this.track = null;
+    this.abort = new AbortController(); this.running = true; this.startedDate = day(this.now()); this.track = null; this._reconnectCount = 0;
     this.runStartedAt = this.now();
     this.diaryStats = { written: 0, skipped: 0, failed: 0, privateWritten: 0, rewriteCalls: 0, rewriteTokens: 0, lastAt: '', lastVideoId: '' };
     this.diaryChain = Promise.resolve();
@@ -219,6 +243,30 @@ export class AutonomousWatch {
     };
     return alive('chat-loop.lock') || alive('spark-loop.lock');
   }
+  // 专用 Edge 崩溃或 DSH 重启导致连接断开时，在本轮里重连再试，不用人工重开一轮。
+  // 只重试“连接层已断”的错误（见 browser-launcher.mjs 的 isEdgeGoneError）；
+  // 业务错误（登录、验证、轮次到点）原样抛出。重连本身走 controller 里的
+  // getBrowser（core.mjs：断开时重新 connect，Edge 不在了就重拉），这里只负责
+  // 退避、探活、再试一次原调用；最多 3 次，之后按原错误收尾。
+  async executeWithReconnect(name, args = {}) {
+    let lastError = null, reconnected = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const output = await this.controller.execute(name, args, { signal: this.abort.signal, autonomousRunId: this.runId });
+        if (reconnected) this.onEvent({ type: 'watch.reconnected', message: `专用浏览器重连后继续：${name}（第 ${attempt + 1} 次尝试）。` });
+        return output;
+      } catch (error) {
+        lastError = error;
+        if (this.abort?.signal.aborted || attempt >= 2 || !isEdgeGoneError(error)) throw error;
+        reconnected = true; this._reconnectCount = (this._reconnectCount || 0) + 1;
+        const waitMs = backoffMs(attempt, 2000);
+        this.onEvent({ type: 'watch.reconnecting', message: `专用浏览器断开，${waitMs / 1000} 秒后重连再试 ${name}（第 ${attempt + 1}/3 次）：${String(error?.message || error).slice(0, 120)}` });
+        try { await this.delayImpl(waitMs, this.abort.signal); } catch { throw this.abort?.signal.reason || lastError; }
+        try { await this.controller.execute('douyin_status', {}, { signal: this.abort.signal, autonomousRunId: this.runId }); } catch { /* 探活失败就继续退避重试，原调用下一次还会再触发重连。 */ }
+      }
+    }
+    throw lastError;
+  }
   async execute(name, args = {}) {
     this.assertAllowed();
     // 2026-10-25：私信处理分享视频时会按住推荐流（watch-hold.flag）。原来只有观察循环会等，
@@ -257,7 +305,7 @@ export class AutonomousWatch {
         await this.delayImpl(1200, this.abort.signal);
       }
     }
-    const output = await this.controller.execute(name, args, { signal: this.abort.signal, autonomousRunId: this.runId }); this.assertAllowed();
+    const output = await this.executeWithReconnect(name, args); this.assertAllowed();
     if (name === 'douyin_status') this._firstProbe = false;
     const state = output?.state || output;
     // 2026-10-26：私信轮询期间面板就是开着的（它整段只关一次门）。这种「面板开着」不算需要人工处理，
@@ -303,6 +351,69 @@ export class AutonomousWatch {
     return this.replyService;
   }
   commentContext() { return this.getCommentService()?.context() ?? { enabled: false, paused: false }; }
+  scheduleStateSafe() { try { return typeof this.videoLimits.scheduleState === 'function' ? { config: this.videoLimits.schedule(), state: this.videoLimits.scheduleState() } : { error: '定时启动接口不可用。' }; } catch (error) { return { error: String(error?.message || error).slice(0, 200) }; } }
+  growthStateSafe() { try { return this.growthState(); } catch (error) { return { error: String(error?.message || error).slice(0, 200) }; } }
+  growthPolicy() { return validateGrowthPolicy(read(this.files.growthPolicy, DEFAULT_GROWTH_POLICY)); }
+  growthLedger() {
+    const value = read(this.files.growthLedger, { version: 1, days: {}, videos: {} });
+    if (!value || value.version !== 1 || !value.days || typeof value.days !== 'object' || Array.isArray(value.days) || !value.videos || typeof value.videos !== 'object' || Array.isArray(value.videos) || Object.entries(value.days).some(([date, counts]) => !/^\d{4}-\d{2}-\d{2}$/.test(date) || !counts || !Number.isSafeInteger(counts.likes) || counts.likes < 0 || !Number.isSafeInteger(counts.comments) || counts.comments < 0) || Object.entries(value.videos).some(([videoId, item]) => !/^\d{1,64}$/.test(videoId) || !item || (item.likedAt !== undefined && typeof item.likedAt !== 'string') || (item.commentedAt !== undefined && typeof item.commentedAt !== 'string') || (item.likeResult !== undefined && typeof item.likeResult !== 'string'))) throw new Error('成长记录损坏，未重置点赞与评论计数。');
+    return value;
+  }
+  growthState() {
+    const policy = this.growthPolicy(), ledger = this.growthLedger(), date = day(this.now());
+    const today = ledger.days[date] || { likes: 0, comments: 0 };
+    return { protocol: 'growth-v1', policy, today: { date, likes: today.likes, comments: today.comments }, likesLeft: Math.max(0, policy.likeDailyCap - today.likes), commentsLeft: Math.max(0, policy.commentDailyCap - today.comments) };
+  }
+  // UI 接线点（协调方）：成长开关与上限由控制台写 growth-policy.json，走这个方法，
+  // 不要直接改 native-settings.mjs；读状态走 state() 里的 growth 字段。
+  configureGrowth(input = {}, { explicit = false } = {}) {
+    if (!explicit) throw Object.assign(new Error('成长点赞与评论只能由用户在控制台明确打开。'), { status: 403 });
+    const policy = validateGrowthPolicy(input);
+    this.control(() => { write(this.files.growthPolicy, policy); });
+    return this.growthState();
+  }
+  recordGrowth(kind, videoId, extra = {}) {
+    if (!['like', 'comment'].includes(kind) || !/^\d{1,64}$/.test(videoId || '')) throw new Error('成长记录参数无效。');
+    return this.control(() => {
+      const ledger = this.growthLedger(), date = day(this.now());
+      ledger.days[date] ||= { likes: 0, comments: 0 };
+      ledger.days[date][kind === 'like' ? 'likes' : 'comments'] += 1;
+      const item = ledger.videos[videoId] || {};
+      if (kind === 'like') { item.likedAt = new Date(this.now()).toISOString(); if (extra.likeResult) item.likeResult = String(extra.likeResult).slice(0, 40); }
+      else item.commentedAt = new Date(this.now()).toISOString();
+      ledger.videos[videoId] = item;
+      write(this.files.growthLedger, ledger);
+      return this.growthState();
+    });
+  }
+  getGrowthCommenter() {
+    if (!this._growthCommenterPromise) this._growthCommenterPromise = import('./comment-browser.mjs?v=10').then(({ CommentBrowser }) => { this._growthCommenter = new CommentBrowser({ source: this.source, videoLimits: this.videoLimits, stateDir: this.stateDir }); return this._growthCommenter; }).catch(error => { this._growthCommenterPromise = null; throw error; });
+    return this._growthCommenterPromise;
+  }
+  // 成长点赞：只对兴趣主题作品点一次；失败只记一笔，绝不拖垮本轮。
+  async maybeGrowthLike({ videoId, decision } = {}) {
+    try {
+      if (growthTopicMatch(decision)) this._growthCandidates.add(videoId);
+      if (!videoId || (!growthTopicMatch(decision) && !this._growthCandidates.has(videoId))) return { acted: false, reason: '不是兴趣主题作品。' };
+      const policy = this.growthPolicy();
+      if (!policy.likeEnabled) return { acted: false, reason: '成长点赞未开启。' };
+      const ledger = this.growthLedger(), today = day(this.now());
+      if (ledger.videos[videoId]?.likedAt) return { acted: false, reason: '这条已经点过赞了。' };
+      if ((ledger.days[today]?.likes || 0) >= policy.likeDailyCap) { this.logDecision({ action: 'growth_like_capped', videoId }); this.onEvent({ type: 'watch.growth_like_capped', message: `今日成长点赞已到上限（${policy.likeDailyCap} 条），这条不点。` }); return { acted: false, reason: '今日成长点赞已到上限。' }; }
+      const commenter = await this.getGrowthCommenter();
+      const result = await commenter.like({ expectedVideoId: videoId }, { signal: this.abort.signal });
+      if (result.liked || result.alreadyLiked || result.deliveryUncertain) this.recordGrowth('like', videoId, { likeResult: result.liked ? 'liked' : result.alreadyLiked ? 'already-liked' : 'uncertain' });
+      if (result.liked) { this.logDecision({ action: 'growth_liked', videoId }); this.onEvent({ type: 'watch.growth_liked', message: '这条是兴趣主题作品，已点赞。' }); }
+      else if (result.alreadyLiked) this.logDecision({ action: 'growth_like_duplicate', videoId });
+      else if (result.deliveryUncertain) { this.logDecision({ action: 'growth_like_uncertain', videoId, reason: result.reason }); this.onEvent({ type: 'watch.growth_like_uncertain', message: `点赞结果未确认：${String(result.reason || '').slice(0, 80)}` }); }
+      else this.logDecision({ action: 'growth_like_skipped', videoId, reason: result.reason });
+      return { acted: Boolean(result.liked), ...result };
+    } catch (error) {
+      this.logDecision({ action: 'growth_like_error', videoId: videoId || null, error: String(error?.message || error).slice(0, 160) });
+      this.onEvent({ type: 'watch.growth_like_error', message: `成长点赞跳过：${String(error?.message || error).slice(0, 120)}` });
+      return { acted: false, reason: String(error?.message || error).slice(0, 200) };
+    }
+  }
   // 2026-10-26 20:10 主人定：观看过程中私信要能一直用页面——私信面板被占用时，人格学习样本跳过即可，
   // 不能像 18:40:38 那样把整轮判死（persona-memory 要求 privateChatVisible === false，面板一开就抛）。
   panelBusySkip(error) {
@@ -858,6 +969,7 @@ export class AutonomousWatch {
       this._lastEndFrame = null;
       // 新的一轮从 20 秒采样开始：上一轮标的 like 不跨轮。
       this._hotVideoId = null;
+      this._growthCandidates = new Set();
       this.save({ pacing: null });
       // 2026-10-30 主人定：开轮时顺手清掉两天前的故事板/拼图，别让 state 目录一直涨。
       try {
@@ -1228,6 +1340,8 @@ export class AutonomousWatch {
         if (result) this.logDecision({ action: 'decision_usage', videoId: observedState.video?.id ?? null, decision: decision.action, usage: result.usage || {} });
         // local add: like 的作品连看补帧从 20 秒缩到 5 秒（只影响这一条，换片自动恢复）。
         this.applyPacing(decision, observedState.video);
+        // 成长点赞（默认关）：模型决定继续看/评论这条、且是兴趣主题作品时才点一次；失败只记一笔，不拖垮本轮。
+        if (decision.action === 'stay' || decision.action === 'comment') await this.maybeGrowthLike({ videoId: observedState.video.id, decision });
         if (decision.action === 'stop') { await this.flushDiary({ position: freshState.video?.time }); break; }
         let learned = false;
         if (decision.action === 'skip') {
@@ -1328,6 +1442,34 @@ export class AutonomousWatch {
           }
           this.assertAllowed();
           if (generated.text !== null) {
+            // 成长评论 gate（默认关）：只对兴趣主题作品、每天最多 commentDailyCap 条。
+            // 开启后，本分支的评论先过这道 gate：不是兴趣作品或到上限就直接换下一条，
+            // 不走自主评论的正常发送；关闭时行为与原来完全一致。核对本身出错时按原流程
+            // 继续（只记一笔），不把整轮判死。
+            try {
+              const growthPolicy = this.growthPolicy();
+              if (growthPolicy.commentEnabled) {
+                const growthLedger = this.growthLedger(), growthToday = day(this.now());
+                if (!this._growthCandidates.has(observedState.video.id)) {
+                  this.logDecision({ action: 'growth_comment_skipped', videoId: observedState.video.id, reason: '不是兴趣主题作品。' });
+                  this.onEvent({ type: 'watch.growth_comment_skipped', message: '成长评论只留给兴趣主题作品，这条不评，换下一条。' });
+                  current = await this.execute('douyin_next');
+                  this._finished = null;
+                  continue;
+                }
+                if ((growthLedger.days[growthToday]?.comments || 0) >= growthPolicy.commentDailyCap) {
+                  this.logDecision({ action: 'growth_comment_capped', videoId: observedState.video.id });
+                  this.onEvent({ type: 'watch.growth_comment_capped', message: '今日成长评论已到上限，这条不评，换下一条。' });
+                  current = await this.execute('douyin_next');
+                  this._finished = null;
+                  continue;
+                }
+                this.recordGrowth('comment', observedState.video.id);
+              }
+            } catch (error) {
+              this.logDecision({ action: 'growth_comment_gate_error', videoId: observedState.video.id, error: String(error?.message || error).slice(0, 160) });
+              this.onEvent({ type: 'watch.growth_comment_gate_error', message: `成长评论核对失败，按原流程继续：${String(error?.message || error).slice(0, 120)}` });
+            }
             let delivery;
             try {
               delivery = await this.getCommentService().comment({ evidenceId, videoId: observedState.video.id, text: generated.text, ...(extraMention ? { extraMentionName: extraMention.name } : {}) }, { signal: this.abort.signal, watchRunId: this.runId });
@@ -1506,7 +1648,28 @@ export class AutonomousWatch {
     else if (worker) this.control(() => { if (this.worker()?.runId === worker.runId) { fs.unlinkSync(this.files.lock); write(this.files.state, { status: 'stopped', sessionId: worker.sessionId, source: worker.source, lastError: '已清理退出进程的残留锁，预算继续保留。' }); } });
     return this.state();
   }
-  async close() { if (this.worker()?.owned) { this.abort?.abort(failure('本入口已关闭。', 'stopped')); await this.completion; if (!this.running && this.worker()?.owned) this.control(() => { if (this.worker()?.owned) fs.unlinkSync(this.files.lock); }); } if (this.ownsShareService) await this.shareService.close(); if (this.ownsCommentService) await this.commentService.close(); }
+  // 定时启动（默认关）：在 video-limits 的调度器上挂“时段开始→开轮、时段结束→停轮”回调。
+  // 只应由宿主在创建 AutonomousWatch 后调一次 watch.startAutoSchedule()（接线点：
+  // dsh-plugin.mjs 创建实例后）；调度器本身默认关闭，打开要走
+  // videoLimits.configureSchedule({ enabled: true }, { explicit: true })。
+  startAutoSchedule() {
+    if (this._autoScheduler) return this._autoScheduler;
+    this._autoScheduler = this.videoLimits.createAutoScheduler({
+      onSlotStart: async ({ sessionId }) => {
+        if (this.running || this.completion) return;
+        try { this.start({ startSession: true }, { explicit: true }); }
+        catch (error) { this.onEvent({ type: 'schedule.watch_start_failed', message: `定时启动后开始自主观看失败：${String(error?.message || error).slice(0, 200)}` }); }
+      },
+      onSlotEnd: async () => {
+        try { if (this.worker()?.owned) await this.stop({ explicit: true }); } catch (error) { this.onEvent({ type: 'schedule.watch_stop_failed', message: `时段结束时停止自主观看失败：${String(error?.message || error).slice(0, 200)}` }); }
+      },
+      onEvent: (event) => this.onEvent(event),
+      delayImpl: this.delayImpl,
+    });
+    return this._autoScheduler;
+  }
+  stopAutoSchedule() { this._autoScheduler?.stop(); this._autoScheduler = null; }
+  async close() { if (this.worker()?.owned) { this.abort?.abort(failure('本入口已关闭。', 'stopped')); await this.completion; if (!this.running && this.worker()?.owned) this.control(() => { if (this.worker()?.owned) fs.unlinkSync(this.files.lock); }); } if (this.ownsShareService) await this.shareService.close(); if (this.ownsCommentService) await this.commentService.close(); this.stopAutoSchedule(); if (this._growthCommenter) await this._growthCommenter.close().catch(() => {}); }
 }
 
 
