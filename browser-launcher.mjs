@@ -1,8 +1,27 @@
 import { chromium } from './playwright-runtime.mjs';
+import { setTimeout as delay } from 'node:timers/promises';
 
 export const PREPARE_PAGE_NAME = 'deepseek-douyin-launcher';
 export const PREPARE_HOME = 'https://www.douyin.com/?recommend=1&from_nav=1';
 const CONNECT_TIMEOUT = 30_000;
+
+// 退避：第 n 次重试前等 baseMs * 2^n，上限 30 秒（纯函数，可单测）。
+export function backoffMs(attempt, baseMs = 1000) {
+  if (!Number.isSafeInteger(attempt) || attempt < 0) throw new Error('重试次数无效。');
+  if (!Number.isSafeInteger(baseMs) || baseMs < 0) throw new Error('退避基准无效。');
+  return Math.min(baseMs * 2 ** attempt, 30_000);
+}
+
+// 专用 Edge 进程已不在（连接被拒/连接断开/目标已关闭）时为真；
+// 超时（TimeoutError）不算——Edge 可能还活着只是忙，绝不能因此去重拉一个新进程抢占资料目录。
+export function isEdgeGoneError(error) {
+  if (!error || typeof error !== 'object') return false;
+  if (error.name === 'TimeoutError') return false;
+  const code = typeof error.code === 'string' ? error.code : '';
+  if (['ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ERR_CONNECTION_REFUSED'].includes(code)) return true;
+  const message = String(error.message || '');
+  return /ECONNREFUSED|ECONNRESET|EPIPE|ERR_CONNECTION_REFUSED|Connection closed|Target closed|Session closed|browser has been closed|page,? context or browser has been closed|connect failed|无法连接|连接.*失败/i.test(message);
+}
 
 function cancelled(signal) { signal?.throwIfAborted(); }
 function abortable(pending, signal, lateResult) {
@@ -20,16 +39,35 @@ function abortable(pending, signal, lateResult) {
 }
 
 // 连接仍只指向已核对归属的专用 CDP；取消时仅断开新建连接，不关闭 Edge 进程。
-export async function connectDedicatedBrowser(endpoint, { signal, connect = (url, options) => chromium.connectOverCDP(url, options) } = {}) {
+// 连接失败时按退避重试（默认最多 3 次连接）；只有确认 Edge 进程已不在、且调用方
+// 给了 relaunch（重拉专用 Edge，见 core.mjs 的 endpoint）时才重拉一次——超时不重拉，
+// 绝不碰用户的普通浏览器；全部失败后仍报原来的错误文案。
+export async function connectDedicatedBrowser(endpoint, { signal, connect = (url, options) => chromium.connectOverCDP(url, options), maxAttempts = 3, retryBaseMs = 1000, relaunch, onRetry } = {}) {
   cancelled(signal);
-  try {
-    return await abortable(connect(endpoint, { timeout: CONNECT_TIMEOUT }), signal, browser => browser.close().catch(() => {}));
-  } catch (error) {
-    cancelled(signal);
-    throw new Error(error?.name === 'TimeoutError'
-      ? '专用 Edge 的调试连接等候30秒仍未就绪。请在本工具的专用窗口关闭无响应标签页后重试。'
-      : '无法连接本工具的专用 Edge。请检查专用窗口是否仍可操作，完成系统提示后重试。');
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) throw new Error('专用浏览器连接次数须在 1 至 10 次之间。');
+  if (!Number.isSafeInteger(retryBaseMs) || retryBaseMs < 0 || retryBaseMs > 30_000) throw new Error('专用浏览器连接退避须在 0 至 30000 毫秒之间。');
+  if (relaunch !== undefined && typeof relaunch !== 'function') throw new Error('专用浏览器重拉接口无效。');
+  let relaunched = false, lastError = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await abortable(connect(endpoint, { timeout: CONNECT_TIMEOUT }), signal, browser => browser.close().catch(() => {}));
+    } catch (error) {
+      cancelled(signal);
+      lastError = error;
+      if (attempt + 1 >= maxAttempts) break;
+      const gone = isEdgeGoneError(error);
+      let relaunchedNow = false, relaunchError = null;
+      if (gone && typeof relaunch === 'function' && !relaunched) {
+        try { await relaunch(); relaunched = true; relaunchedNow = true; } catch (cause) { relaunchError = cause; }
+      }
+      onRetry?.({ attempt, error, gone, willRelaunch: relaunchedNow, ...(relaunchError ? { relaunchError } : {}) });
+      try { await delay(backoffMs(attempt, retryBaseMs), undefined, { signal }); } catch { cancelled(signal); throw lastError; }
+    }
   }
+  cancelled(signal);
+  throw new Error(lastError?.name === 'TimeoutError'
+    ? '专用 Edge 的调试连接等候30秒仍未就绪。请在本工具的专用窗口关闭无响应标签页后重试。'
+    : '无法连接本工具的专用 Edge。请检查专用窗口是否仍可操作，完成系统提示后重试。');
 }
 
 function installPreparePause({ label }) {
