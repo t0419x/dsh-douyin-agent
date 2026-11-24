@@ -74,6 +74,7 @@ export function createNativeSettingsRoute({ getController, getComments, getRepli
           try { const chat = await getChat(); if (chat.state().running) chat.stop(); } catch { /* 没起过就算了 */ }
           break;
         }
+        case '/watch/growth/configure': value = await (await getWatch()).configureGrowth(input, { explicit: true }); break;
         case '/spark/configure': value = await (await getSpark()).configure(input, { explicit: true }); break;
         case '/spark/stop': empty(input); value = await (await getSpark()).stop({ explicit: true }); break;
         case '/spark/start': empty(input); value = await startSpark(); break;
@@ -89,7 +90,7 @@ export function createNativeSettingsRoute({ getController, getComments, getRepli
         case '/share/resolve': value = await (await getShare()).resolve(input, { explicit: true }); break;
         case '/chat/contacts': empty(input); value = await (await getChat()).listContacts({ signal: AbortSignal.timeout(45_000) }); break;
         case '/chat/configure': {
-          if (Object.keys(input).some(key => !['recipientIds', 'aliases', 'dailyReplyLimit'].includes(key))) throw Object.assign(new Error('私信设置只接收许可联系人、备注和每日上限。'), { status: 400 });
+          if (Object.keys(input).some(key => !['recipientIds', 'aliases', 'dailyReplyLimit', 'catchupWindowHours', 'newcomerMode', 'newcomerKeywords', 'newcomerDailyCap', 'quickReplies'].includes(key))) throw Object.assign(new Error('私信设置只接收许可联系人、备注、每日上限、补发窗口、新人模式与快捷回复。'), { status: 400 });
           value = await (await getChat()).configure(input); break;
         }
         case '/chat/start': empty(input); value = await startChat(); break;
