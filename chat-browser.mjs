@@ -46,7 +46,7 @@ const readFollowingRows = () => {
   const seen = new Set();
   return out.filter(item => (seen.has(item.displayName) ? false : (seen.add(item.displayName), true)));
 };
-const readableDraft = value => value.replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, '').trim();
+const readableDraft = value => value.replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u115F\u1160\u3164\uFFA0]/g, '').trim();
 const localDay = value => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(value));
 
 export function analyzeConversationDay(snapshot, { now = Date.now, confirmedHistory = [], greetingAsReply = false } = {}) {
@@ -232,7 +232,7 @@ export function readChatIdentityDom() {
 // 会话列表去重：抖音同一批会话会被重复渲染成几十条同名行，且每行原生 id 都不一样。
 // 按昵称归一化分组（去零宽字符/空白/大小写/标点差异），每组只保留一行；组内优先保留已在白名单里的那条。
 export function dedupeContactRows(rawRows, preferredIds = new Set()) {
-  const clean = value => String(value || '').replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, '').replace(/\s+/g, ' ').trim();
+  const clean = value => String(value || '').replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u115F\u1160\u3164\uFFA0]/g, '').replace(/\s+/g, ' ').trim();
   const keyOf = value => clean(value).normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '') || clean(value);
   const convOf = row => `conv:${hash(row.nativeId ? `native:${row.nativeId}` : `${row.displayName}\0${row.avatar}`)}`;
   const groups = new Map();
