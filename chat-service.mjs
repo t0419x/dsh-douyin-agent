@@ -6,14 +6,78 @@ import { ChatAgent } from './chat-agent.mjs?v=9';
 import { loadApiConfig, redact } from './api-agent.mjs';
 import { messageFingerprint } from './chat-message.mjs';
 import { OutboundCoordinator } from './outbound-send.mjs';
+import { sendToast } from './toast.mjs';
 
 // 2026-10-28 主人定：分享视频的采样跟着推荐流走——1.5 秒一张、共 6 张（7.5 秒窗口）。
 const WATCH_SAMPLE_SECONDS = 7.5;
 const WATCH_SAMPLE_FRAMES = 6;
 
-const basePolicy = () => ({ version: 1, enabled: false, allowlist: [], dailyReplyLimit: 40 });
+// #10 快捷回复默认模板：通用问法，不写具体价格（主人从未定过价），用户可在设置里改。
+export const DEFAULT_QUICK_REPLIES = [
+  { keywords: ['价格', '多少钱', '收费', '报价', '怎么收费'], reply: '可以先说说想做什么，我按具体内容来定，价格是按单子算的，开始做之前会先跟你确认好。' },
+  { keywords: ['怎么下单', '如何下单', '怎么找你做', '下单'], reply: '直接在这里说一下需求就行，我看过之后回复你，确认好内容再开始做。' },
+  { keywords: ['包括什么', '包含什么', '能做什么', '可以做什么'], reply: '主要看你想做什么：说清楚需求和想要的效果，我会告诉你能不能做、打算怎么做。' },
+  { keywords: ['多久', '多长时间', '要几天', '什么时候能好'], reply: '时间要看具体内容，确认好需求后我会跟你说大概要多久。' },
+];
+const basePolicy = () => ({ version: 1, enabled: false, allowlist: [], dailyReplyLimit: 40, catchupWindowHours: 6, newcomerMode: false, newcomerKeywords: ['codex', '接单'], newcomerDailyCap: 5, quickReplies: DEFAULT_QUICK_REPLIES.map((item) => ({ keywords: [...item.keywords], reply: item.reply })) });
+
+// #2 把消息上的时间标解析成毫秒时间戳；认不出来返回 null（不猜）。
+// 接受：数字 epoch（秒/毫秒）、ISO、"刚刚/N分钟前/N小时前/N天前"、"今天 HH:MM"、"昨天/前天 HH:MM"、"M月D日"、"M-D"、"YYYY-M-D"。
+export function parseMessageTime(message, now = Date.now()) {
+  const raw = String(message?.dateEvidence?.raw ?? message?.sentAt ?? message?.timestamp ?? '').trim();
+  if (!raw) return null;
+  if (typeof message?.sentAt === 'number' || typeof message?.timestamp === 'number') {
+    const n = typeof message.sentAt === 'number' ? message.sentAt : message.timestamp;
+    if (Number.isFinite(n) && n > 0) return n < 1e11 ? n * 1000 : n;
+  }
+  if (/^\d{10,13}$/.test(raw)) { const n = Number(raw); return raw.length === 10 ? n * 1000 : n; }
+  if (/^刚刚/.test(raw)) return now;
+  let m;
+  if ((m = /^(\d+)\s*分钟前/.exec(raw))) return now - Number(m[1]) * 60_000;
+  if ((m = /^(\d+)\s*小时前/.exec(raw))) return now - Number(m[1]) * 3_600_000;
+  if ((m = /^(\d+)\s*天前/.exec(raw))) return now - Number(m[1]) * 86_400_000;
+  const shanghaiDay = (ms) => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(ms));
+  const atShanghai = (day, hh, mm) => Date.parse(`${day}T${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:00+08:00`);
+  if ((m = /^(?:今天\s*)?(\d{1,2}):(\d{2})/.exec(raw))) { const t = atShanghai(shanghaiDay(now), m[1], m[2]); return t > now ? t - 86_400_000 : t; }
+  if ((m = /^昨天\s*(\d{1,2}):(\d{2})/.exec(raw))) return atShanghai(shanghaiDay(now - 86_400_000), m[1], m[2]);
+  if ((m = /^前天\s*(\d{1,2}):(\d{2})/.exec(raw))) return atShanghai(shanghaiDay(now - 2 * 86_400_000), m[1], m[2]);
+  if ((m = /^(\d{1,2})[-/月](\d{1,2})日?/.exec(raw))) {
+    const year = Number(shanghaiDay(now).slice(0, 4));
+    const guess = `${year}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`;
+    const t = Date.parse(`${guess}T00:00:00+08:00`);
+    if (!Number.isFinite(t)) return null;
+    return t <= now ? t : Date.parse(`${year - 1}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}T00:00:00+08:00`);
+  }
+  const iso = Date.parse(raw);
+  return Number.isFinite(iso) ? iso : null;
+}
+// #10 快捷回复匹配：任一关键词在正文里出现（不区分大小写）即命中，返回模板正文。
+export function matchQuickReply(text, templates = DEFAULT_QUICK_REPLIES) {
+  const hay = String(text || '').toLowerCase();
+  if (!hay.trim()) return null;
+  for (const tpl of Array.isArray(templates) ? templates : []) {
+    if (!tpl || typeof tpl.reply !== 'string' || !tpl.reply.trim()) continue;
+    const keywords = Array.isArray(tpl.keywords) ? tpl.keywords : [];
+    if (keywords.some((k) => typeof k === 'string' && k.trim() && hay.includes(k.toLowerCase()))) return tpl.reply;
+  }
+  return null;
+}
+// #4 新人关键词匹配：同上，只返回是否命中。
+export function matchNewcomerKeywords(text, keywords = ['codex', '接单']) {
+  const hay = String(text || '').toLowerCase();
+  if (!hay.trim()) return false;
+  return (Array.isArray(keywords) ? keywords : []).some((k) => typeof k === 'string' && k.trim() && hay.includes(k.toLowerCase()));
+}
 const dayKey = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 const load = (file, fallback) => fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : fallback;
+// 旧版 chat-watermarks.json 里没有 newcomers：缺失就补空对象，不报错。
+function normalizeWatermarks(watermarks) {
+  if (!watermarks || typeof watermarks !== 'object') return { version: 1, contacts: {}, days: {}, newcomers: {} };
+  if (!watermarks.contacts || typeof watermarks.contacts !== 'object') watermarks.contacts = {};
+  if (!watermarks.days || typeof watermarks.days !== 'object') watermarks.days = {};
+  if (!watermarks.newcomers || typeof watermarks.newcomers !== 'object' || Array.isArray(watermarks.newcomers)) watermarks.newcomers = {};
+  return watermarks;
+}
 const alive = (pid) => { if (!Number.isSafeInteger(pid) || pid < 1) return false; try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
 function save(file, value) { fs.mkdirSync(path.dirname(file), { recursive: true }); const temporary = `${file}.${process.pid}.tmp`; fs.writeFileSync(temporary, JSON.stringify(value, null, 2), { mode: 0o600 }); fs.renameSync(temporary, file); }
 function initialize(file, value) { fs.mkdirSync(path.dirname(file), { recursive: true }); let descriptor; try { descriptor = fs.openSync(file, 'wx', 0o600); } catch (error) { if (error.code === 'EEXIST') return; throw error; } try { fs.writeFileSync(descriptor, JSON.stringify(value, null, 2)); } finally { fs.closeSync(descriptor); } }
@@ -24,9 +88,27 @@ function recentEvents(file) {
   finally { fs.closeSync(descriptor); }
 }
 function validatePolicy(policy) {
+  // 旧版 chat-policy.json 里没有新字段：缺失就补默认值，不报错、不丢旧配置。
+  if (policy.catchupWindowHours === undefined) policy.catchupWindowHours = 6;
+  if (policy.newcomerMode === undefined) policy.newcomerMode = false;
+  if (policy.newcomerKeywords === undefined) policy.newcomerKeywords = ['codex', '接单'];
+  if (policy.newcomerDailyCap === undefined) policy.newcomerDailyCap = 5;
+  if (policy.quickReplies === undefined) policy.quickReplies = DEFAULT_QUICK_REPLIES.map((item) => ({ keywords: [...item.keywords], reply: item.reply }));
+  if (!Number.isSafeInteger(policy.catchupWindowHours) || policy.catchupWindowHours < 0 || policy.catchupWindowHours > 72) throw new Error('私信补发窗口须在 0 至 72 小时之间。');
+  if (typeof policy.newcomerMode !== 'boolean') throw new Error('新人模式开关须是布尔值。');
+  if (!Array.isArray(policy.newcomerKeywords) || !policy.newcomerKeywords.length || policy.newcomerKeywords.length > 20 || policy.newcomerKeywords.some((k) => typeof k !== 'string' || !k.trim() || [...k].length > 20)) throw new Error('新人关键词须是 1 至 20 个、每个不超过 20 字的文本。');
+  if (!Number.isSafeInteger(policy.newcomerDailyCap) || policy.newcomerDailyCap < 1 || policy.newcomerDailyCap > 20) throw new Error('新人每日回复上限须在 1 至 20 之间。');
+  if (!Array.isArray(policy.quickReplies) || policy.quickReplies.length > 20 || policy.quickReplies.some((item) => !item || typeof item !== 'object' || !Array.isArray(item.keywords) || !item.keywords.length || item.keywords.length > 10 || item.keywords.some((k) => typeof k !== 'string' || !k.trim() || [...k].length > 30) || typeof item.reply !== 'string' || !item.reply.trim() || [...item.reply].length > 500)) throw new Error('快捷回复模板格式无效：每条最多 10 个关键词、回复不超过 500 字。');
   if (!Number.isSafeInteger(policy.dailyReplyLimit) || policy.dailyReplyLimit < 1 || policy.dailyReplyLimit > 200) throw new Error('私信每日请求上限须在 1 至 200 之间。');
   if (!Array.isArray(policy.allowlist) || policy.allowlist.length > 10 || new Set(policy.allowlist.map((item) => item.id)).size !== policy.allowlist.length) throw new Error('白名单最多十个不同联系人。');
-  for (const item of policy.allowlist) if (typeof item.id !== 'string' || !item.id || item.id.length > 500 || item.followed !== true || item.isGroup !== false || !item.verifiedAt) throw new Error('白名单联系人必须已有关注关系与非群聊核对记录。');
+  for (const item of policy.allowlist) {
+    if (typeof item.id !== 'string' || !item.id || item.id.length > 500 || !item.verifiedAt) throw new Error('白名单联系人必须已有核对记录。');
+    if (item.isGroup === false) { if (item.followed !== true) throw new Error('白名单联系人必须已有关注关系与非群聊核对记录。'); }
+    else if (item.isGroup === true) {
+      if (item.followed === false) throw new Error('白名单群聊关注状态异常，未核对。');
+      if (item.identitySource !== undefined && item.identitySource !== 'native' && !(item.identitySource === 'display-name-avatar' && typeof item.identityAvatar === 'string' && item.identityAvatar)) throw new Error('白名单群聊缺少稳定会话身份，未核对。');
+    } else throw new Error('白名单联系人必须已有关注关系与非群聊核对记录。');
+  }
   // 2026-10-26 主人定：每个好友可以有一条「备注称呼」，回复时就按这个叫法称呼对方。
   for (const item of policy.allowlist) if (item.alias !== undefined && (typeof item.alias !== 'string' || [...item.alias].length > 30)) throw new Error('联系人备注须是不超过 30 个字的文本。');
   return policy;
@@ -85,7 +167,7 @@ export class ChatService {
     this.logFile = path.join(stateDir, 'chat-events.jsonl');
     this.lockFile = path.join(stateDir, 'chat-loop.lock'); this.stopFile = path.join(stateDir, 'chat-stop.request.json'); this.guardFile = path.join(stateDir, 'chat-control.guard');
     this.policy = validatePolicy(load(this.policyFile, basePolicy()));
-    this.watermarks = load(this.watermarkFile, { version: 1, contacts: {}, days: {} });
+    this.watermarks = normalizeWatermarks(load(this.watermarkFile, { version: 1, contacts: {}, days: {} }));
     this.running = false; this.busy = false; this.timer = null; this.abort = null; this.starting = null; this.runId = null; this.heartbeat = null; this.ownershipLost = false;
     this.events = [];
     if (!fs.existsSync(this.watermarkFile)) initialize(this.watermarkFile, this.watermarks);
@@ -97,6 +179,18 @@ export class ChatService {
     fs.mkdirSync(this.stateDir, { recursive: true });
     fs.appendFileSync(this.logFile, `${JSON.stringify(event)}\n`, { mode: 0o600 });
     this.events.push(event); if (this.events.length > 100) this.events.shift();
+  }
+  // #5 通知：只用现成的 toast.mjs，永不抛异常、永不阻塞主流程；卡住类事件每轮每种最多一条。
+  notify(title, body, dedupKey) {
+    try {
+      if (dedupKey) { this._toastedKeys ??= new Set(); if (this._toastedKeys.has(dedupKey)) return; this._toastedKeys.add(dedupKey); }
+      sendToast({ title, body: String(body || '').slice(0, 200) });
+    } catch { /* 通知发不出去只是这一轮没提醒到 */ }
+  }
+  notifyReplySent(contact, text) {
+    const name = contact?.name || contact?.id || '联系人';
+    const snippet = String(text || '').replace(/^\[自动回复\]\s*/, '').trim().slice(0, 80);
+    this.notify('抖音私信已回复', snippet ? `${name}：${snippet}` : name);
   }
   persist() { if (this.ownershipLost) throw new Error('回复进程已失去锁，未覆盖其他入口的水位。'); if (this.runId) this.assertOwned(); save(this.watermarkFile, this.watermarks); }
   control(action) {
@@ -131,7 +225,7 @@ export class ChatService {
       this.runId = randomUUID(); this.ownershipLost = false;
       try { fs.writeFileSync(descriptor, JSON.stringify({ pid: process.pid, runId: this.runId, heartbeatAt: new Date().toISOString(), status: 'starting' })); }
       finally { fs.closeSync(descriptor); }
-      this.watermarks = load(this.watermarkFile, { version: 1, contacts: {}, days: {} });
+      this.watermarks = normalizeWatermarks(load(this.watermarkFile, { version: 1, contacts: {}, days: {} }));
       for (const mark of Object.values(this.watermarks.contacts)) if (mark.status === 'inflight') { mark.status = 'delivery-uncertain'; mark.reason = '上次进程在发送确认前结束，请人工核对。'; }
       this.persist();
     });
@@ -153,8 +247,22 @@ export class ChatService {
   }
   state() {
     const worker = this.worker();
-    if (!worker?.owned) { this.policy = validatePolicy(load(this.policyFile, this.policy)); this.watermarks = load(this.watermarkFile, this.watermarks); this.events = recentEvents(this.logFile); }
-    return { running: this.running || Boolean(worker?.alive && worker.status === 'running'), starting: Boolean(this.starting || worker?.status === 'starting'), busy: this.busy, worker, coordination: { protocol: 'guard-v1', guardPresent: fs.existsSync(this.guardFile) }, pollSeconds: this.pollIntervalMs / 1000, replyTokens: this.agent.replyTokens ?? 512, policy: this.policy, daily: { date: dayKey(), requests: this.watermarks.days[dayKey()] ?? 0, limit: this.policy.dailyReplyLimit }, contacts: Object.entries(this.watermarks.contacts).filter(([id]) => this.policy.allowlist.some((item) => item.id === id)).map(([id, mark]) => ({ id, status: mark.status, reason: mark.reason || '', pending: mark.pending || null, unanswered: mark.unanswered || [], lastCheckedAt: mark.lastCheckedAt })), events: this.events.slice(-30) };
+    if (!worker?.owned) { this.policy = validatePolicy(load(this.policyFile, this.policy)); this.watermarks = normalizeWatermarks(load(this.watermarkFile, this.watermarks)); this.events = recentEvents(this.logFile); }
+    return { running: this.running || Boolean(worker?.alive && worker.status === 'running'), starting: Boolean(this.starting || worker?.status === 'starting'), busy: this.busy, worker, coordination: { protocol: 'guard-v1', guardPresent: fs.existsSync(this.guardFile) }, pollSeconds: this.pollIntervalMs / 1000, replyTokens: this.agent.replyTokens ?? 512, policy: this.policy, daily: { date: dayKey(), requests: this.watermarks.days[dayKey()] ?? 0, limit: this.policy.dailyReplyLimit }, contacts: Object.entries(this.watermarks.contacts).filter(([id]) => this.policy.allowlist.some((item) => item.id === id)).map(([id, mark]) => ({ id, status: mark.status, reason: mark.reason || '', pending: mark.pending || null, unanswered: mark.unanswered || [], lastCheckedAt: mark.lastCheckedAt })), events: this.events.slice(-30), needsAttention: this.needsAttention(), newcomers: { enabled: Boolean(this.policy.newcomerMode), repliedToday: this.newcomerRepliedToday(), cap: this.policy.newcomerDailyCap ?? 5 } };
+  }
+  // #5 state() 里已有的 status/reason/pending/unanswered 之外，再给一个汇总：哪些联系人/新人正等着人工处理。
+  needsAttention() {
+    const list = [];
+    for (const [id, mark] of Object.entries(this.watermarks.contacts || {})) {
+      if (!this.policy.allowlist.some((item) => item.id === id)) continue;
+      if (['paused', 'delivery-uncertain', 'budget-paused'].includes(mark?.status) || ['unclassified', 'outbound-wait'].includes(mark?.pending?.phase)) list.push({ id, status: mark.status, reason: mark.reason || '', phase: mark.pending?.phase || null });
+    }
+    for (const [id, record] of Object.entries(this.watermarks.newcomers || {})) if (record?.status === 'delivery-uncertain') list.push({ id, status: 'newcomer-delivery-uncertain', reason: '新人回复发送未确认，请人工核对。', phase: null });
+    return list;
+  }
+  newcomerRepliedToday() {
+    const today = dayKey();
+    return Object.values(this.watermarks.newcomers || {}).filter((record) => record?.status === 'replied' && record?.date === today).length;
   }
   async listContacts({ signal } = {}) { return this.browser.listContacts({ verifyFollowing: true, signal, preferredIds: this.policy.allowlist.map((item) => item.id) }); }
   async readConversation(id, { signal } = {}) {
@@ -445,7 +553,7 @@ export class ChatService {
     return result;
   }
 
-  async configure({ recipientIds, aliases, dailyReplyLimit = this.policy.dailyReplyLimit } = {}) {
+  async configure({ recipientIds, aliases, dailyReplyLimit = this.policy.dailyReplyLimit, catchupWindowHours = this.policy.catchupWindowHours ?? 6, newcomerMode = this.policy.newcomerMode ?? false, newcomerKeywords = this.policy.newcomerKeywords ?? ['codex', '接单'], newcomerDailyCap = this.policy.newcomerDailyCap ?? 5, quickReplies = this.policy.quickReplies } = {}) {
     if (this.running || this.starting || this.busy || this.worker()?.alive) throw new Error('请先停止私信自动回复，再修改白名单或预算。');
     if (!Array.isArray(recipientIds) || recipientIds.length > 10 || recipientIds.some((id) => typeof id !== 'string')) throw new Error('请选择最多十个已关注联系人。');
     const result = await this.browser.listContacts({ verifyFollowing: true, preferredIds: this.policy.allowlist.map((item) => item.id) });
@@ -455,13 +563,16 @@ export class ChatService {
     const previousAlias = new Map(this.policy.allowlist.map((item) => [item.id, typeof item.alias === 'string' ? item.alias : '']));
     const allowlist = recipientIds.map((id) => {
       const contact = result.contacts?.find((item) => item.id === id);
-      if (!contact || contact.followed !== true || contact.isGroup !== false) throw new Error('所选联系人尚未核对为已关注的个人联系人。');
+      if (!contact) throw new Error('所选联系人尚未核对。');
+      const isGroup = contact.isGroup === true;
+      if (isGroup) { if (contact.followed === false) throw new Error('所选群聊关注状态异常，未核对。'); }
+      else if (contact.followed !== true || contact.isGroup !== false) throw new Error('所选联系人尚未核对为已关注的个人联系人。');
       const alias = String((aliases && aliases[id]) ?? previousAlias.get(id) ?? '').replace(/[\r\n\t]/g, ' ').trim().slice(0, 30);
-      return { id, name: contact.name || contact.displayName || '联系人', alias, followed: true, isGroup: false, verifiedAt: new Date().toISOString(), relationshipEvidence: contact.relationshipEvidence || '浏览器关系回读' };
+      return { id, name: contact.name || contact.displayName || '联系人', alias, followed: isGroup ? (contact.followed ?? null) : true, isGroup, verifiedAt: new Date().toISOString(), relationshipEvidence: contact.relationshipEvidence || '浏览器关系回读', ...(isGroup ? { identitySource: contact.identitySource, stableIdentity: contact.stableIdentity, identityAvatar: contact.avatar || '' } : {}) };
     });
-    const policy = validatePolicy({ version: 1, enabled: false, allowlist, dailyReplyLimit });
+    const policy = validatePolicy({ version: 1, enabled: false, allowlist, dailyReplyLimit, catchupWindowHours, newcomerMode, newcomerKeywords, newcomerDailyCap, quickReplies });
     this.acquire();
-    try { this.control(() => { this.assertOwned(); this.policy = policy; save(this.policyFile, this.policy); }); this.log('policy.updated', { recipientIds, dailyReplyLimit }); }
+    try { this.control(() => { this.assertOwned(); this.policy = policy; save(this.policyFile, this.policy); }); this.log('policy.updated', { recipientIds, dailyReplyLimit, catchupWindowHours, newcomerMode, newcomerDailyCap }); }
     finally { this.release(); }
     return this.state();
   }
@@ -517,8 +628,8 @@ export class ChatService {
         // 2026-10-24 21:40：光记住「没回」不够——poll 会把这些消息判成 known-old-window 直接跳过，
         // 于是主人看到的是「打开看了消息、换下一个、就是不回」。这里先认下待补发的最后几条。
         const catchup = this.catchupMessages(messages);
-        this.watermarks.contacts[contact.id] = { status: 'ready', seen: baseline.slice(-2000), context: [], unanswered: unanswered.slice(-60), catchup: catchup.length > 0, catchupTries: 0, startedAt: new Date().toISOString(), lastCheckedAt: new Date().toISOString() };
-        if (catchup.length) this.log('message.catchup_pending', { recipientId: contact.id, count: catchup.length, last: catchup.at(-1)?.text || '' });
+        this.watermarks.contacts[contact.id] = { status: 'ready', seen: baseline.slice(-2000), context: [], unanswered: unanswered.slice(-60), catchup: catchup.length > 0, catchupTries: 0, deliveryRetries: 0, deliveryRetryAt: null, startedAt: new Date().toISOString(), lastCheckedAt: new Date().toISOString() };
+        if (catchup.length) this.log('message.catchup_pending', { recipientId: contact.id, count: catchup.length, windowHours: this.policy.catchupWindowHours ?? 6, last: catchup.at(-1)?.text || '' });
         readyContacts += 1;
       }
       if (!readyContacts) throw new Error('白名单联系人在当前会话列表里一个都没找到，未启用自动回复。');
@@ -554,7 +665,7 @@ export class ChatService {
   resumeContact(id) {
     if (this.running || this.starting || this.busy || this.worker()?.alive) throw new Error('请先停止自动回复，再人工解除联系人暂停。');
     this.acquire();
-    try { this.control(() => { this.assertOwned(); this.policy = validatePolicy(load(this.policyFile, this.policy)); this.watermarks = load(this.watermarkFile, this.watermarks);
+    try { this.control(() => { this.assertOwned(); this.policy = validatePolicy(load(this.policyFile, this.policy)); this.watermarks = normalizeWatermarks(load(this.watermarkFile, this.watermarks));
       if (!this.policy.allowlist.some((item) => item.id === id)) throw new Error('联系人不在白名单。');
       const mark = this.watermarks.contacts[id]; if (mark) { mark.status = 'ready'; mark.reason = ''; this.persist(); }
     }); this.log('contact.manually_resolved', { recipientId: id, message: '用户确认已核对发送结果；下次启动将重新建立基线，不重发旧消息。' }); }
@@ -585,37 +696,101 @@ export class ChatService {
         mark.status = 'ready'; mark.pending = { ...mark.pending, phase: 'outbound-wait', generatedText: reply.text, expectedContent, usage: reply.usage, at: new Date().toISOString() }; this.persist(); this.log('reply.waiting_for_sender', { recipientId: contact.id }); return;
       }
       if (!entered) throw error;
-      mark.status = 'delivery-uncertain'; mark.reason = '发送中断或失败，需人工核对；不会自动重发。'; this.persist(); this.log('delivery.uncertain', { recipientId: contact.id, message: error.message }); return;
+      mark.status = 'delivery-uncertain'; mark.reason = '发送中断或失败，下次轮询会重试一次，仍未确认请人工核对。'; this.persist(); this.log('delivery.uncertain', { recipientId: contact.id, message: error.message }); return;
     }
     if (delivery?.superseded) { this.log('reply.superseded', { recipientId: contact.id }); return; }
-    if (delivery?.confirmed !== true || typeof delivery.messageId !== 'string' || !delivery.messageId.trim()) { mark.status = 'delivery-uncertain'; mark.reason = '未取得发送确认，需人工核对；不会自动重发。'; this.persist(); this.log('delivery.uncertain', { recipientId: contact.id, confirmed: delivery?.confirmed, messageId: delivery?.messageId || null, reason: delivery?.reason || null }); return; }
-    mark.status = 'ready'; mark.reason = ''; mark.context.push({ id: delivery.messageId, sender: 'outgoing', text: reply.text }); mark.context = mark.context.slice(-12);
+    if (delivery?.confirmed !== true || typeof delivery.messageId !== 'string' || !delivery.messageId.trim()) { mark.status = 'delivery-uncertain'; mark.reason = '未取得发送确认，下次轮询会重试一次，仍未确认请人工核对。'; this.persist(); this.log('delivery.uncertain', { recipientId: contact.id, confirmed: delivery?.confirmed, messageId: delivery?.messageId || null, reason: delivery?.reason || null }); return; }
+    mark.status = 'ready'; mark.reason = ''; mark.deliveryRetries = 0; mark.deliveryRetryAt = null; mark.context.push({ id: delivery.messageId, sender: 'outgoing', text: reply.text }); mark.context = mark.context.slice(-12);
     mark.seen.push(delivery.messageId); delete mark.pending; this.persist();
     this.log('reply.sent', { recipientId: contact.id, text: reply.text, messageId: delivery.messageId, usage: reply.usage });
+    this.notifyReplySent(contact, reply.text);
   }
   // 会话末尾「我说完就没了」的部分就是没回的：取最后一条我自己发的之后的对方消息。
   // 只认今天能看出来的时间（刚刚 / N分钟前 / N小时前 / 今天 / HH:MM），久远历史不追，避免突然回一句几个月前的。
-  catchupMessages(messages) {
-    const lastOutgoing = messages.findLastIndex((item) => item.sender === 'outgoing');
-    const tail = messages.slice(lastOutgoing + 1).filter((item) => item.sender === 'incoming' && item.unsupported !== true);
-    if (!tail.length) return [];
+  // #2 补发窗口：窗口内（默认 6 小时）的对方消息也补，即使它在最后一条我方消息之前、或日期标签看着旧——
+  // 只要时间戳能解析且落在窗口内。认不出时间的消息不进窗口，只走原来的尾巴逻辑。每位联系人最多补 10 条。
+  catchupMessages(messages, { windowHours = this.policy?.catchupWindowHours ?? 6, now = Date.now() } = {}) {
+    const list = Array.isArray(messages) ? messages : [];
+    const lastOutgoing = list.findLastIndex((item) => item.sender === 'outgoing');
+    const tail = list.slice(lastOutgoing + 1).filter((item) => item.sender === 'incoming' && item.unsupported !== true);
     const raw = String(tail.at(-1)?.dateEvidence?.raw ?? tail.at(-1)?.sentAt ?? tail.at(-1)?.timestamp ?? '').trim();
     // 2026-10-25：以前只认「刚刚/N分钟前/今天/昨天/HH:MM」，读不到时间标记（空串）就直接放弃——
     // 微光那条「滴滴滴」就是这么漏的。现在反过来：只有明确是旧日期的才不补，其余一律补。
     const looksOld = /^\d{4}[-/年]|\d{1,2}\s*月\s*\d{1,2}\s*日|\d+\s*(?:天|周|个月|年)前|星期[一二三四五六日天]|^\d{1,2}-\d{1,2}$/.test(raw);
-    return looksOld ? [] : tail;
+    const base = looksOld ? [] : tail;
+    const hours = Number.isSafeInteger(windowHours) ? windowHours : 6;
+    if (hours <= 0) return base.slice(-10);
+    const cutoff = now - hours * 3_600_000;
+    const inWindow = list.filter((item) => {
+      if (item.sender !== 'incoming' || item.unsupported === true) return false;
+      const at = parseMessageTime(item, now);
+      return at !== null && at >= cutoff && at <= now + 300_000;
+    });
+    const merged = [...new Map([...base, ...inWindow].map((item) => [item.id, item])).values()];
+    const order = new Map(list.map((item, index) => [item.id, index]));
+    merged.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
+    return merged.slice(-10);
+  }
+  // #3 发送未确认只重试一次：先核对是不是其实已经发出去了，没发才在 60 秒后重发一次；
+  // 重试后仍未确认就记成 delivery-uncertain、通知一声，等下次轮询的自动核对把它清回 ready，
+  // 不再把联系人挂起、也不挡其他联系人。返回 'skip' 时由调用方继续走原来的自动核对。
+  async retryUncertainSend(contact, mark, signal) {
+    const retries = Number(mark.deliveryRetries) || 0;
+    if (retries >= 1) return 'skip';
+    const now = Date.now();
+    const retryAt = mark.deliveryRetryAt ? Date.parse(mark.deliveryRetryAt) : NaN;
+    if (!Number.isFinite(retryAt)) {
+      mark.deliveryRetryAt = new Date(now + 60_000).toISOString();
+      this.persist();
+      this.log('delivery.retry_scheduled', { recipientId: contact.id, retryAt: mark.deliveryRetryAt });
+      return 'scheduled';
+    }
+    if (now < retryAt) return 'scheduled';
+    const text = String(mark.pending?.generatedText || mark.pending?.text || '').trim();
+    if (!text) return 'skip';
+    mark.deliveryRetries = retries + 1;
+    mark.deliveryRetryAt = null;
+    this.persist();
+    this.log('delivery.retrying', { recipientId: contact.id, attempt: mark.deliveryRetries });
+    try {
+      const check = await this.browser.readConversation(contact.id, { allowed: true, signal });
+      const latest = messagesOf(check);
+      const wanted = text.replace(/\s+/g, '');
+      const already = Boolean(wanted) && latest.some((item) => item.sender === 'outgoing' && String(item.text || '').replace(/\s+/g, '') === wanted);
+      if (already) {
+        mark.status = 'ready'; mark.reason = ''; delete mark.pending; mark.deliveryRetries = 0;
+        mark.seen = [...new Set([...(mark.seen || []), ...latest.map((item) => item.id)])].slice(-2000);
+        mark.lastCheckedAt = new Date().toISOString(); this.persist();
+        this.log('delivery.retry_confirmed', { recipientId: contact.id, message: '重试前核对发现其实已经发出去了，不再重发。' });
+        return 'retried';
+      }
+      await this.deliverReply(contact, mark, { text, usage: mark.pending?.usage }, latest, signal, { followUp: true });
+    } catch (error) { this.log('delivery.retry_failed', { recipientId: contact.id, message: String(error?.message || error).slice(0, 120) }); }
+    if (mark.pending?.phase === 'outbound-wait') { this.log('delivery.retry_queued', { recipientId: contact.id, message: '重试遇到发送通道占用，等下次轮询继续发。' }); return 'retried'; }
+    if (mark.status === 'ready' && !mark.pending) {
+      mark.deliveryRetries = 0; this.persist();
+      this.log('delivery.retry_confirmed', { recipientId: contact.id });
+      return 'retried';
+    }
+    mark.status = 'delivery-uncertain';
+    mark.reason = '重试一次后仍未取得发送确认，请人工核对；不会再自动重发。';
+    this.persist();
+    this.log('delivery.retry_exhausted', { recipientId: contact.id });
+    this.notify('抖音私信需要处理', `${contact.name || contact.id}：发送未确认，已重试一次，请人工核对。`, `retry-exhausted:${contact.id}`);
+    return 'retried';
   }
   async poll() {
     if (!this.running || this.busy) { this.log('poll.skip', { running: this.running, busy: this.busy }); return; }
     this.assertOwned();
     this.log('poll.tick', { at: new Date().toISOString() });
     this.busy = true; const signal = this.abort.signal;
+    this._pollTick = (this._pollTick || 0) + 1; this._toastedKeys = new Set();
     // 2026-10-25：整段轮询期间面板只开一次，别每读一次会话就关一次门（主人看到的就是反复拉开又关掉）。
     this.browser.holdPanel?.();
     // 2026-10-25 23:25 主人：有角标就只读有未读的那个会话，别把白名单挨个读一遍。
     // 2026-10-24 的回退（永远 null）是因为「列表半渲染时读不到角标 → 已读不回」；
     // 现在只在行确实渲染出来时才敢跳过，行没出现就当未知、照旧读（见 planUnreadFilter）。
-    let unreadIds = null;
+    let unreadIds = null; let contactRows = [];
     const mustRead = Object.entries(this.watermarks.contacts || {})
       .filter(([, mark]) => ['delivery-uncertain', 'inflight'].includes(mark?.status) || mark?.pending?.phase === 'outbound-wait' || mark?.catchup === true)
       .map(([id]) => id);
@@ -633,14 +808,21 @@ export class ChatService {
       try {
         const listed = await this.browser.listContacts({ signal, verifyFollowing: false, preferredIds: this.policy.allowlist.map((item) => item.id) });
         const rows = Array.isArray(listed?.contacts) ? listed.contacts : [];
+        contactRows = rows;
         if (!listed?.blocked && rows.length) {
           const plan = planUnreadFilter({ rows, allowlist: this.policy.allowlist, mustRead });
           unreadIds = plan.unread;
           this.log('poll.unread_rows', { rows: plan.rows, read: plan.unread.size, missing: plan.missing.length });
           if (!plan.anyWhitelist) {
-            try { this.browser.releasePanel?.(); await this.browser.closePanel?.(); } catch { /* 关不上不影响这一轮跳过 */ }
-            this.log('poll.no_whitelist_unread', { message: '红点都不在白名单会话上，这一轮不逐个读。' });
-            return;
+            const allowIds = new Set(this.policy.allowlist.map((item) => item.id));
+            const hasNewcomerUnread = this.policy.newcomerMode && rows.some((row) => row.unread === true && !allowIds.has(row.id));
+            if (!hasNewcomerUnread) {
+              try { this.browser.releasePanel?.(); await this.browser.closePanel?.(); } catch { /* 关不上不影响这一轮跳过 */ }
+              this.log('poll.no_whitelist_unread', { message: '红点都不在白名单会话上，这一轮不逐个读。' });
+              return;
+            }
+            // 新人模式开着且有非白名单未读：不提前返回；下面把 unreadIds 置空跳过白名单循环，只跑新人分支。
+            unreadIds = new Set();
           }
         }
       } catch (error) {
@@ -652,6 +834,8 @@ export class ChatService {
         // 2026-10-24 主人定：发送未确认不再等人点「已人工核对」，下一次轮询自己核对：
         // 会话里找到刚发的那条就算已发，找不到就清掉标记、下一次重新回。
         if (mark && mark.status === 'delivery-uncertain') {
+          const retryOutcome = await this.retryUncertainSend(contact, mark, signal);
+          if (retryOutcome !== 'skip') continue;
           try {
             const check = await this.browser.readConversation(contact.id, { allowed: true, signal });
             const seenMessages = messagesOf(check);
@@ -700,7 +884,7 @@ export class ChatService {
             if (catchup.length) {
               fresh.push(...catchup);
               mark.catchupTries = (mark.catchupTries || 0) + 1;
-              this.log('message.catchup_reply', { recipientId: contact.id, count: catchup.length, last: catchup.at(-1)?.text || '' });
+              this.log('message.catchup_reply', { recipientId: contact.id, count: catchup.length, windowHours: this.policy.catchupWindowHours ?? 6, last: catchup.at(-1)?.text || '' });
             }
           }
           if (fresh.some((item) => item.sender === 'unknown')) { mark.pending = { phase: 'unclassified', incoming: fresh.map((item) => ({ id: item.id, sender: item.sender, text: item.text || '' })), at: new Date().toISOString() }; throw new Error('新消息方向未确认，联系人已暂停，消息未计入已处理水位。'); }
@@ -723,7 +907,7 @@ export class ChatService {
           const lastIncoming = messages.findLastIndex((item) => incoming.some((freshItem) => freshItem.id === item.id));
           if (messages.slice(lastIncoming + 1).some((item) => item.sender === 'outgoing')) { this.log('message.handled_by_user', { recipientId: contact.id, messageIds: incoming.map((item) => item.id) }); mark.pending = { phase: 'handled-by-user', incoming: incoming.map((item) => ({ id: item.id, text: item.text })), at: new Date().toISOString() }; this.persist(); continue; }
           const date = dayKey();
-          if ((this.watermarks.days[date] ?? 0) >= this.policy.dailyReplyLimit) { mark.status = 'budget-paused'; mark.reason = '已达到每日模型请求上限；旧消息不自动补发。'; mark.pending = { phase: 'budget', incoming: incoming.map((item) => ({ id: item.id, text: item.text })), at: new Date().toISOString() }; this.persist(); this.log('budget.reached', { recipientId: contact.id }); continue; }
+          if ((this.watermarks.days[date] ?? 0) >= this.policy.dailyReplyLimit) { mark.status = 'budget-paused'; mark.reason = '已达到每日模型请求上限；旧消息不自动补发。'; mark.pending = { phase: 'budget', incoming: incoming.map((item) => ({ id: item.id, text: item.text })), at: new Date().toISOString() }; this.persist(); this.log('budget.reached', { recipientId: contact.id }); this.notify('抖音私信需要处理', `${contact.name || contact.id}：已达到每日模型请求上限。`, 'budget'); continue; }
           const mediaObservations=[];
           const mediaItems = incoming.filter(item => item.media);
           if (mediaItems.length) this.holdWatchForMedia();
@@ -742,6 +926,17 @@ export class ChatService {
             mediaObservations.push({...observed,frames:observed.frames.slice(0,remaining)});
           }
           if (mediaItems.length) this.browser.holdPanel?.();
+          // #10 快捷回复：命中模板直接回，不调模型、不占每日模型预算；带媒体的消息仍走看片流程。
+          if (!mediaItems.length) {
+            const quickText = matchQuickReply(incoming.map((item) => item.text || '').join('\n'), this.policy.quickReplies);
+            if (quickText) {
+              mark.pending = { phase: 'quick-reply', incoming: incoming.map((item) => ({ id: item.id, text: item.text })), at: new Date().toISOString() }; this.persist();
+              this.log('message.quick_reply', { recipientId: contact.id, text: quickText.slice(0, 120) });
+              await this.deliverReply(contact, mark, { text: quickText, usage: null }, messages, signal);
+              if (mark.catchup && (!mark.pending || (mark.catchupTries || 0) >= 2)) { mark.catchup = false; this.persist(); }
+              continue;
+            }
+          }
           this.watermarks.days[date] = (this.watermarks.days[date] ?? 0) + 1;
           mark.pending = { phase: 'model', incoming: incoming.map((item) => ({ id: item.id, text: item.text })), at: new Date().toISOString() }; this.persist();
           this.log('message.received', { recipientId: contact.id, messages: incoming.map((item) => ({ id: item.id, text: item.text })) });
@@ -764,10 +959,19 @@ export class ChatService {
           // 补发成功（pending 已被清掉）就收工；失败两次也不再挂着，免得红点门控一直为此开面板。
           if (mark.catchup && (!mark.pending || (mark.catchupTries || 0) >= 2)) { mark.catchup = false; this.persist(); }
         } catch (error) {
-          if (mark.status === 'inflight') { mark.status = 'delivery-uncertain'; mark.reason = '发送被中断，需要人工核对。'; }
+          if (mark.status === 'inflight') { mark.status = 'delivery-uncertain'; mark.reason = '发送被中断，下次轮询会重试一次，仍未确认请人工核对。'; }
           else { mark.status = 'paused'; mark.reason = signal.aborted ? '用户停止时有未答消息，已保留在本机，未发送。' : redact(error.message, [this.config?.apiKey]); if (signal.aborted && mark.pending) mark.pending.phase = 'stopped-before-send'; }
           this.persist(); if (!signal.aborted) this.log('contact.paused', { recipientId: contact.id, message: mark.reason });
+          if (!signal.aborted && mark.status === 'paused') {
+            if (mark.pending?.phase === 'unclassified') this.notify('抖音私信需要处理', `${contact.name || contact.id}：新消息方向未确认，联系人已暂停。`, `unclassified:${contact.id}`);
+            else this.notify('抖音私信需要处理', `${contact.name || contact.id}：${String(mark.reason || '').slice(0, 120)}`, `paused:${contact.id}`);
+          }
         }
+      }
+      // #4 新人模式（默认关）：只看本轮会话列表里有未读红点的非白名单会话。
+      if (this.policy.newcomerMode && contactRows.length) {
+        try { await this.handleNewcomers({ rows: contactRows, signal }); }
+        catch (error) { if (!signal.aborted) this.log('newcomer.error', { message: String(error?.message || error).slice(0, 120) }); }
       }
     } finally {
       this.busy = false;
@@ -775,6 +979,61 @@ export class ChatService {
       try { await this.browser.closePanel?.(); } catch { /* 关不上不影响结果 */ }
       if (this._mediaHold) this.releaseWatchHold();
       if (!this.running) this.release();
+    }
+  }
+  // #4 新人模式：非白名单发来的私信，只有正文命中关键词才回一次；回过的不再回，每天最多 newcomerDailyCap 个。
+  // 不回无关键词的、已回过的、以及当天已达上限的；走模型时同样占每日模型预算。
+  async handleNewcomers({ rows = [], signal } = {}) {
+    const allowIds = new Set(this.policy.allowlist.map((item) => item.id));
+    const today = dayKey();
+    const candidates = rows.filter((row) => row && typeof row.id === 'string' && row.unread === true && !allowIds.has(row.id)).slice(0, 5);
+    if (!candidates.length) return;
+    if (this.newcomerRepliedToday() >= (this.policy.newcomerDailyCap ?? 5)) { this.log('newcomer.cap_reached', { message: '新人今日回复已达上限。' }); return; }
+    for (const row of candidates) {
+      signal?.throwIfAborted();
+      if (this.newcomerRepliedToday() >= (this.policy.newcomerDailyCap ?? 5)) return;
+      try {
+        const snapshot = await this.browser.readConversation(row.id, { allowed: true, signal });
+        const messages = messagesOf(snapshot);
+        if (messages.at(-1)?.sender !== 'incoming') continue;
+        const incoming = messages.filter((item) => item.sender === 'incoming' && typeof item.text === 'string' && item.text.trim()).slice(-3);
+        if (!incoming.length) continue;
+        const last = incoming.at(-1);
+        const fingerprint = messageFingerprint(last);
+        const record = (this.watermarks.newcomers || {})[row.id];
+        if (record?.status === 'replied') continue;
+        if (record?.fingerprint === fingerprint && record?.date === today) continue;
+        const text = incoming.map((item) => item.text).join('\n');
+        if (!matchNewcomerKeywords(text, this.policy.newcomerKeywords)) {
+          this.watermarks.newcomers[row.id] = { status: 'no-keyword', fingerprint, date: today, at: new Date().toISOString() };
+          this.persist();
+          this.log('newcomer.no_keyword', { recipientId: row.id });
+          continue;
+        }
+        if ((this.watermarks.days[today] ?? 0) >= this.policy.dailyReplyLimit) {
+          this.watermarks.newcomers[row.id] = { status: 'budget', fingerprint, date: today, at: new Date().toISOString() };
+          this.persist();
+          this.log('newcomer.budget', { recipientId: row.id });
+          continue;
+        }
+        const context = messages.slice(-6);
+        this.watermarks.days[today] = (this.watermarks.days[today] ?? 0) + 1;
+        const reply = await this.agent.reply({ messages: context, mediaObservations: [], signal, contact: { id: row.id, name: row.displayName || row.id, alias: '' } });
+        signal?.throwIfAborted();
+        const mark = { status: 'ready', seen: messages.map((item) => item.id), context: [], pending: null };
+        await this.deliverReply({ id: row.id, name: row.displayName || row.id }, mark, reply, messages, signal);
+        if (mark.status === 'ready' && !mark.pending) {
+          this.watermarks.newcomers[row.id] = { status: 'replied', fingerprint, date: today, at: new Date().toISOString() };
+          this.persist();
+          this.log('newcomer.replied', { recipientId: row.id });
+        } else if (mark.status === 'delivery-uncertain') {
+          this.watermarks.newcomers[row.id] = { status: 'delivery-uncertain', fingerprint, date: today, at: new Date().toISOString() };
+          this.persist();
+          this.log('newcomer.delivery_uncertain', { recipientId: row.id });
+        }
+      } catch (error) {
+        this.log('newcomer.failed', { recipientId: row.id, message: String(error?.message || error).slice(0, 120) });
+      }
     }
   }
   async close() { if (this.runId) this.stop(); while (this.busy || this.starting) await new Promise((resolve) => setTimeout(resolve, 20)); await this.browser.close?.(); if(this.inspectorPromise) await this.inspectorPromise.then(inspector=>inspector.close()).catch(()=>{}); }
