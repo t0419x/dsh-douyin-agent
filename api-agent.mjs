@@ -358,6 +358,7 @@ export class ApiAgent {
     Object.assign(this, { controller, config, personaMemory, fetchImpl, toolDefinitions, ...actualLimits });
   }
 
+  // 观看裁决：有 decisionProvider 时走 DSH 原生模型（其 route 决定用观看模型还是主模型），否则走中转；返回的 model 是本次实际使用的模型。
   async decideWatch({ observation, context = this.personaMemory?.context() || '', shareContext, commentContext, signal, decisionProvider } = {}) {
     const messages = watchDecisionMessages(observation, { context: redact(context, [this.config.apiKey]), shareContext, commentContext, maxFrames: this.maxFrames, maxFrameBytes: this.maxFrameBytes });
     if (!decisionProvider && !this.config.apiKey) throw new Error('自主观看需要先配置 API Key。');
@@ -377,7 +378,7 @@ export class ApiAgent {
           }
           actualSignal.throwIfAborted();
           const normalizedUsage = Object.fromEntries([['promptTokens', 'prompt_tokens'], ['completionTokens', 'completion_tokens'], ['totalTokens', 'total_tokens']].map(([camel, snake]) => [camel, Number.isSafeInteger(usage?.[snake] ?? usage?.[camel]) && (usage[snake] ?? usage[camel]) >= 0 ? usage[snake] ?? usage[camel] : 0]));
-          return { decision: redact(parseWatchDecision(text, { shareContext, commentContext }), [this.config.apiKey]), usage: normalizedUsage };
+          return { decision: redact(parseWatchDecision(text, { shareContext, commentContext }), [this.config.apiKey]), usage: normalizedUsage, model: decisionProvider?.route?.model || this.config.model };
         } catch (error) {
           // local fix: 模型偶尔吐非 JSON，重试一次再判死（共用同一个超时计时器）。
           if (attempt >= 1 || actualSignal.aborted || !/没有返回有效 JSON/.test(String(error?.message || ''))) throw error;

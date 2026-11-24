@@ -1,17 +1,28 @@
 import { randomUUID } from 'node:crypto';
+import { NativeModelSettings } from './native-model-settings.mjs';
 
 const IMAGE = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/]+={0,2})$/;
 
 // 复用当前 DSH 模型路由和附件接口；不读取模型凭据或普通会话历史。
 // 2026-10-23：上限 1200 太紧——决策 JSON 同时带 reason/reflection/topics/diary/say，
 // 中文一长就直接被截断，整轮判 failed（实测 15:07 那次 16 次决策白烧）。抬到 2400，并在截断时重试一次更短的。
-export function createNativeWatchDecision({ llm, attachments, agent, maxTokens = 2400 }) {
+// 模型分流：purpose 默认 'reply'（原有调用方不受影响，仍用主模型）；purpose 为 'watch' 时优先用
+// native-model.json 里单独配的观看模型（便宜模型），没配就回落主模型。调用方也可以直接注入
+// modelSettings（NativeModelSettings 实例）；没注入时这里按同一默认路径自读一次配置文件。
+export function createNativeWatchDecision({ llm, attachments, agent, maxTokens = 2400, purpose = 'reply', modelSettings }) {
   if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > 2400) throw new Error('原生模型生成上限须在1至2400之间。');
+  if (purpose !== 'watch' && purpose !== 'reply') throw new Error('模型用途只能是 watch 或 reply。');
   const header = agent?.session?.requestHeader?.()?.config;
-  const provider = header?.provider ?? agent?.options?.provider;
-  const model = header?.model ?? agent?.options?.model;
+  const agentProvider = header?.provider ?? agent?.options?.provider;
+  const agentModel = header?.model ?? agent?.options?.model;
+  let provider = agentProvider, model = agentModel;
+  if (purpose === 'watch') {
+    let watchRoute = null;
+    try { watchRoute = modelSettings?.routeFor?.('watch') ?? new NativeModelSettings({}).routeFor('watch'); } catch { watchRoute = null; }
+    if (watchRoute?.provider && watchRoute?.model) { provider = watchRoute.provider; model = watchRoute.model; }
+  }
   if (!provider || !model || typeof llm?.stream !== 'function' || typeof llm?.resolveModelInfo !== 'function') throw new Error('当前 DSH 未提供可核实的模型路由，不能启动自主观看。');
-  return async function decide({ system, messages, signal }) {
+  const decide = async function decide({ system, messages, signal }) {
     signal?.throwIfAborted();
     const info = await llm.resolveModelInfo(provider, model, signal);
     const hasImages = messages.some(message => Array.isArray(message.content) && message.content.some(part => part.type === 'image_url'));
@@ -68,4 +79,7 @@ export function createNativeWatchDecision({ llm, attachments, agent, maxTokens =
     if (finish?.kind !== 'stop' || !text.trim()) throw new Error(`DSH 自主观看决策未完整返回（${finish?.kind || '缺少完成标记'}），未执行动作。`);
     return { text, usage };
   };
+  // 调用方和裁决路径用它确认本次实际走的模型（省积分核对）；不影响 decide 本身的调用方式。
+  decide.route = { provider, model, purpose };
+  return decide;
 }
