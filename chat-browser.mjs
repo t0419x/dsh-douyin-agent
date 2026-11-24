@@ -8,6 +8,12 @@ export { MessageIdentityTracker } from './message-tracker.mjs';
 
 const HOME = 'https://www.douyin.com/?recommend=1&from_nav=1';
 const hash = value => createHash('sha256').update(value).digest('hex');
+// 会话身份：有原生 id 时稳定（native:），只有昵称+头像时身份随改名/换头像而变。
+// 群聊没有可关注的个人关系，是否“稳定”只看这里，不看 followed。
+export function conversationIdentity(row) {
+  const native = row?.nativeId ? `native:${row.nativeId}` : null;
+  return { id: `conv:${hash(native ?? `${row.displayName}\0${row.avatar}`)}`, source: native ? 'native' : 'display-name-avatar', stable: Boolean(native) };
+}
 const stop = signal => signal?.throwIfAborted();
 // 2026-10-31：读「我的关注」名单。原来的实现依赖抖音的哈希类名（.OlxToPIh / .Zce7SWd3），
 // 改版后名单还会开在新标签页，导致 followed 全是 null、设置页的许可好友勾选框全灰。
@@ -234,7 +240,7 @@ export function readChatIdentityDom() {
 export function dedupeContactRows(rawRows, preferredIds = new Set()) {
   const clean = value => String(value || '').replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u115F\u1160\u3164\uFFA0]/g, '').replace(/\s+/g, ' ').trim();
   const keyOf = value => clean(value).normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '') || clean(value);
-  const convOf = row => `conv:${hash(row.nativeId ? `native:${row.nativeId}` : `${row.displayName}\0${row.avatar}`)}`;
+  const convOf = row => conversationIdentity(row).id;
   const groups = new Map();
   for (const raw of rawRows) {
     const displayName = clean(raw?.displayName);
@@ -375,7 +381,7 @@ export class ChatBrowser {
     // 旧写法只看原生 id，可同一人每次渲染的 id 都不一样，去重等于没做；现在先按昵称归一化分组，
     // 组内优先保留「已在白名单里」的那条，这样勾选状态不会因为换了条 id 而错位。
     const rows = dedupeContactRows(rawRows, this.preferredContactIds ?? new Set());
-    const identities = rows.map(row => `conv:${hash(row.nativeId ? `native:${row.nativeId}` : `${row.displayName}\0${row.avatar}`)}`);
+    const identities = rows.map(row => conversationIdentity(row).id);
     if (new Set(identities).size !== identities.length || rows.some(row => !row.displayName || (!row.nativeId && !row.avatar))) throw new Error('联系人身份不完整或存在歧义，已停止读取会话。');
     const contacts = [];
     const marks = [];
@@ -385,7 +391,8 @@ export class ChatBrowser {
       const matching = this.following?.filter(item => item.displayName === row.displayName && item.mutual) ?? [];
       const uniqueName = rows.filter(item => item.displayName === row.displayName).length === 1;
       const followed = matching.length === 1 && uniqueName ? true : null;
-      const contact = { id, displayName: row.displayName, name: row.displayName, unread: row.unread, followed, isGroup: row.isGroup ? true : followed ? false : null,
+      const identity = conversationIdentity(row);
+      const contact = { id, displayName: row.displayName, name: row.displayName, unread: row.unread, followed, isGroup: row.isGroup ? true : followed ? false : null, identitySource: identity.source, stableIdentity: identity.stable,
         relationshipEvidence: followed ? { source: 'self-follow-list', label: '相互关注', matchedBy: 'unique-display-name', accountIdCrossChecked: false } : null };
       this.contacts.set(id, { ...contact, avatar: row.avatar });
       contacts.push(contact);
@@ -416,7 +423,7 @@ export class ChatBrowser {
     const flags = await this.contactList(page, signal);
     if (flags.blocked) return { flags };
     const contact = this.contacts.get(recipientId);
-    if (!contact || contact.isGroup === true) throw new Error('指定联系人已变化或属于群聊，已停止操作。');
+    if (!contact) throw new Error('指定联系人已变化，已停止操作。');
     const row = page.locator(`[data-e2e="conversation-item"][data-deepseek-chat-id="${recipientId}"]`);
     if (await row.count() !== 1) throw new Error('指定会话不是唯一匹配，已停止操作。');
     const current = await page.evaluate(readChatIdentityDom);
